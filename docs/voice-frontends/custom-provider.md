@@ -25,6 +25,9 @@ The extension boundary is:
 - Each Provider is an independent adapter that owns its URL, authentication, model, session, and error-classification semantics. Product differences should not be carried by reshaping another Provider.
 - `url()`, `headers()`, and `model()` can read the service URL, token, and model from host-owned configuration closures. The Gateway does not require product-specific environment variables.
 - `createProtocol()` runs once for each Realtime connection, so connection IDs and mutable state remain isolated.
+- `createProtocol({ emit })` receives an `emit(event)` hook. A protocol may call it to inject a synthetic provider event, which flows through `normalizeIncoming()` like a server message; full-duplex services with no turn-complete event use it to close a spoken segment after output goes quiet.
+- `createProtocol({ send })` also receives a `send(payload)` hook that sends a wire event through `encodeOutgoing()`, for a protocol that must repair something on its own, such as re-sending a tool result the service rejected.
+- The `concurrentVoicePlayback` capability declares a full-duplex service whose voice output runs alongside its backend work. The protocol marks the synthetic responses that only represent playback with `__voicePlayback: true` on their `response.created` / `response.done`; the runtime then keeps them off the idle gate, treats a cancel as a playback interruption only, and never lets a new user turn supersede the backend's tool calls. Default off; other providers are unaffected.
 - Optional synchronous `validateSessionOptions({ sessionOptions })` runs before opening the
   upstream connection. Only reject known-invalid selections; leave unknown values to the service.
 - `connectionMessages()` emits raw handshake frames after the WebSocket opens and before `session.update`.

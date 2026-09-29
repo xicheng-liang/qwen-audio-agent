@@ -25,6 +25,9 @@ createGatewayApplication({
 - 每个 Provider 都是独立适配器，完整拥有自己的 URL、认证、模型、Session 和错误分类语义；不要通过改造另一个 Provider 来承载业务差异。
 - `url()`、`headers()`、`model()` 可从宿主配置闭包读取服务地址、令牌和模型；Gateway 不要求为业务 Provider 增加环境变量。
 - `createProtocol()` 每条 Realtime 连接调用一次，适合生成连接级 ID 和隔离状态。
+- `createProtocol({ emit })` 会收到一个 `emit(event)` 钩子。协议可以用它注入一条合成的服务端事件，该事件与真实服务端消息一样经过 `normalizeIncoming()`；没有「本轮说完」事件的全双工服务用它在输出静默后收掉当前语音段。
+- `createProtocol({ send })` 还会收到一个 `send(payload)` 钩子，经 `encodeOutgoing()` 发出一条协议事件，供协议自行修复某些状态，例如重发被服务端拒收的工具结果。
+- `concurrentVoicePlayback` 能力声明这是一个语音输出与后端工作并行的全双工服务。协议在只代表播放的合成 response 的 `response.created` / `response.done` 上标 `__voicePlayback: true`；运行时据此不让它们占用空闲门禁、把取消只当作打断播放、并且不让新的用户轮次顶掉后端的函数调用。默认关闭，其他 Provider 不受影响。
 - 可选的同步 `validateSessionOptions({ sessionOptions })` 在上游连接前执行；只拒绝已确认无效的配置，未知值交给服务端验证。
 - `connectionMessages()` 在 WebSocket 打开后、`session.update` 之前发送原始握手帧。
 - 其余事件通过 `encodeOutgoing()` 与 `normalizeIncoming()` 转换，Gateway 的工具调用、任务和客户端协议保持不变。
