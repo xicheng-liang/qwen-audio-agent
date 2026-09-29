@@ -1,0 +1,12 @@
+# BuildKit reads <Dockerfile>.dockerignore, so upstream never sees a root .dockerignore.
+.git
+node_modules
+**/node_modules
+web/dist
+docs/.vitepress/dist
+desktop/dist
+*.log
+.env
+.env.*
+ops/*.env
+config.env
