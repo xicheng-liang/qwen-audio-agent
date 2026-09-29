@@ -313,7 +313,7 @@ export class RealtimeInputRuntime {
       content: display,
       turnId: inputTurnId,
     })
-    this.ensureFrontend()
+    this.ensureFrontend({ turnId: inputTurnId })
       .then(() => this.getFrontend().sendUserInput(parts, inputContext))
       .then(outcome => {
         if (!outcome?.timedOut) return

@@ -3,6 +3,7 @@ import test from 'node:test'
 import { WebSocketServer } from 'ws'
 import { config } from '../src/core/config.mjs'
 import { RealtimeFrontend } from '../src/voice/realtime-provider.mjs'
+import { RealtimeProviderSession } from '../src/voice/realtime-provider-session.mjs'
 import { gptLive1Provider, sessionInputHistory } from '../src/voice/providers/gpt-live-1.mjs'
 import { ToolCallHandler } from '../src/frontend/tools/tool-call-handler.mjs'
 import {
@@ -20,6 +21,7 @@ import {
 import {
   defaultRealtimeProviderRegistry,
   describeActiveRealtime,
+  validateRealtimeProvider,
 } from '../src/voice/providers/registry.mjs'
 import { resolveRealtimeModelProfile } from '../../shared/realtime-model-catalog.mjs'
 import { assertRealtimeFrontendModel } from '../../shared/realtime-provider-catalog.mjs'
@@ -257,12 +259,14 @@ test('GPT-Live 1 protocol brackets spoken output into responses by timeline gaps
     type: 'session.output_audio.delta', delta: 'CCCC', start_ms: 5000, end_ms: 5100,
   })
   assert.deepEqual(later.map(event => event.type), [
-    'response.done', 'response.created', 'response.output_audio.delta',
+    'response.output_audio_transcript.done', 'response.done', 'response.created', 'response.output_audio.delta',
   ])
-  assert.equal(later[0].response.id, responseId)
-  assert.equal(later[0].response.status, 'completed')
-  assert.notEqual(later[1].response.id, responseId)
-  assert.equal(later[2].response_id, later[1].response.id)
+  // The closed segment's transcript is final, so the runtime records the assistant turn.
+  assert.deepEqual(later[0], { type: 'response.output_audio_transcript.done', response_id: responseId, transcript: '你好' })
+  assert.equal(later[1].response.id, responseId)
+  assert.equal(later[1].response.status, 'completed')
+  assert.notEqual(later[2].response.id, responseId)
+  assert.equal(later[3].response_id, later[2].response.id)
 })
 
 test('GPT-Live 1 protocol synthesises the user turn from timed transcript fragments', () => {
@@ -1009,9 +1013,10 @@ test('GPT-Live 1 grows the question caption from late fragments without starting
   assert.deepEqual(protocol.normalizeIncoming({ type: 'gpt-live-1.input_idle' }), [], 'not completed twice')
   // Speech that began after the answer began is a barge-in: a new turn, playback cancelled.
   const barge = protocol.normalizeIncoming({ type: 'session.input_transcript.delta', delta: '等', start_ms: 3500, end_ms: 3700 })
-  assert.deepEqual(types(barge), ['response.done', 'input_audio_buffer.speech_started', 'conversation.item.input_audio_transcription.delta'])
-  assert.equal(barge[0].response.status, 'cancelled')
-  assert.notEqual(barge[1].item_id, itemId)
+  assert.deepEqual(types(barge), ['response.output_audio_transcript.done', 'response.done', 'input_audio_buffer.speech_started', 'conversation.item.input_audio_transcription.delta'])
+  assert.equal(barge[0].transcript, '好', 'what was said before the cut is recorded')
+  assert.equal(barge[1].response.status, 'cancelled')
+  assert.notEqual(barge[2].item_id, itemId)
 })
 
 test('GPT-Live 1 falls back to arrival order for turns when the transport sends no output timing', () => {
@@ -1127,4 +1132,749 @@ test('GPT-Live 1 encodes assistant history for the backend as output_text', () =
   const protocol = createGptLive1Protocol()
   const item = protocol.conversationItemCreate({ type: 'message', role: 'assistant', content: [{ type: 'text', text: '好的' }] })
   assert.deepEqual(item.item.content, [{ type: 'output_text', text: '好的' }])
+})
+
+function keepaliveHarness(t, { refuse = false } = {}) {
+  t.mock.timers.enable({ apis: ['setInterval'] })
+  let clock = 0
+  const sent = []
+  const protocol = createGptLive1Protocol({
+    send: (payload, options) => {
+      sent.push({ payload, options })
+      // The runtime's send returns the encoded body, or undefined once the socket is gone.
+      return refuse ? undefined : payload
+    },
+    now: () => clock,
+    inputKeepaliveMs: 100,
+    inputKeepaliveGapMs: 500,
+    outputIdleMs: 0,
+  })
+  const advance = ms => {
+    for (let step = 0; step < ms; step += 100) {
+      clock += 100
+      t.mock.timers.tick(100)
+    }
+  }
+  const silenceMs = () => sent
+    .filter(entry => entry.payload.type === 'session.input_audio.append')
+    .map(entry => Buffer.from(entry.payload.audio, 'base64').length / 2 / 24)
+  return { protocol, sent, advance, silenceMs, setClock: value => { clock = value } }
+}
+
+test('GPT-Live 1 keeps the session timeline moving with real-time silence when no audio is sent', t => {
+  const { protocol, sent, advance, silenceMs } = keepaliveHarness(t)
+  advance(300)
+  assert.deepEqual(sent, [], 'nothing before session.started')
+  protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  advance(1000)
+  assert.equal(silenceMs().length, 10)
+  assert.equal(silenceMs().reduce((sum, ms) => sum + ms, 0), 1000, 'silence matches elapsed wall-clock time')
+  assert.ok(silenceMs().every(ms => ms === 100))
+  assert.ok(sent.every(entry => entry.options?.audio === true), 'sent under the audio backpressure budget')
+  assert.ok(Buffer.from(sent[0].payload.audio, 'base64').every(byte => byte === 0), 'PCM16 zeros')
+})
+
+test('GPT-Live 1 appends no silence while real input audio flows, and fills only the gap after it stops', t => {
+  const { protocol, sent, advance, silenceMs } = keepaliveHarness(t)
+  protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  for (let i = 0; i < 10; i += 1) {
+    protocol.encodeOutgoing(protocol.audioAppend('AAAA'))
+    advance(100)
+  }
+  assert.deepEqual(silenceMs(), [], 'a streaming microphone is never padded')
+  advance(300)
+  assert.deepEqual(silenceMs(), [], 'nothing inside the gap')
+  advance(100)
+  assert.deepEqual(silenceMs(), [500], 'the first fill covers the time since the last real audio')
+  advance(100)
+  assert.deepEqual(silenceMs(), [500, 100])
+  assert.equal(sent.length, 2)
+})
+
+test('GPT-Live 1 stops the silence keepalive on session.closed and on a failed send', t => {
+  const closed = keepaliveHarness(t)
+  closed.protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  closed.advance(200)
+  closed.protocol.normalizeIncoming({ type: 'session.closed', reason: 'client' })
+  closed.advance(1000)
+  assert.equal(closed.silenceMs().length, 2)
+
+  t.mock.timers.reset()
+  const failed = keepaliveHarness(t, { refuse: true })
+  failed.protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  failed.advance(1000)
+  assert.equal(failed.silenceMs().length, 1, 'the socket is gone after the first refused append')
+})
+
+function pcmFrame({ amplitude = 0, ms = 100 } = {}) {
+  const samples = 24 * ms
+  const pcm = Buffer.alloc(samples * 2)
+  for (let i = 0; i < samples; i += 1) pcm.writeInt16LE(Math.round(amplitude * Math.sin(i / 8)), i * 2)
+  return pcm.toString('base64')
+}
+
+test('GPT-Live 1 does not play the silent output stream between answers, and keeps a soft onset', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const protocol = createGptLive1Protocol({ emit: () => {}, outputIdleMs: 800 })
+  protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  const silence = pcmFrame()
+  const onset = pcmFrame({ amplitude: 60 })
+  for (let i = 0; i < 5; i += 1) {
+    assert.deepEqual(protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: silence }), [], 'idle silence is dropped')
+  }
+  assert.deepEqual(protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: onset }), [], 'a sub-threshold onset is held, not played')
+  const speech = pcmFrame({ amplitude: 3000 })
+  const events = protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: speech })
+  assert.deepEqual(events.map(event => event.type), ['response.created', 'response.output_audio.delta', 'response.output_audio.delta'])
+  assert.equal(events[1].delta, onset, 'the held frame plays first')
+  assert.equal(events[2].delta, speech)
+})
+
+test('GPT-Live 1 closes a spoken segment one idle window after the last spoken frame despite continuous silence', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const emitted = []
+  let protocol = null
+  protocol = createGptLive1Protocol({ emit: event => emitted.push(...[].concat(protocol.normalizeIncoming(event))), outputIdleMs: 800 })
+  protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  const opened = protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: pcmFrame({ amplitude: 3000 }) })
+  const responseId = opened[0].response_id
+  const pauses = []
+  for (let i = 0; i < 7; i += 1) {
+    pauses.push(...protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: pcmFrame() }))
+    t.mock.timers.tick(100)
+  }
+  assert.equal(pauses.length, 7, 'a pause inside speech is still played')
+  assert.ok(pauses.every(event => event.type === 'response.output_audio.delta' && event.response_id === responseId))
+  assert.deepEqual(emitted, [])
+  t.mock.timers.tick(100)
+  assert.deepEqual(emitted.map(event => event.type), ['response.done'], 'silence does not hold the segment open')
+  assert.equal(emitted[0].response_id, responseId)
+  assert.deepEqual(protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: pcmFrame() }), [], 'trailing silence is dropped')
+})
+
+test('GPT-Live 1 finalizes the spoken transcript when a segment closes, so the assistant turn reaches history', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const emitted = []
+  let protocol = null
+  protocol = createGptLive1Protocol({ emit: event => emitted.push(...[].concat(protocol.normalizeIncoming(event))), outputIdleMs: 800 })
+  protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  const opened = protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: pcmFrame({ amplitude: 3000 }) })
+  protocol.normalizeIncoming({ type: 'session.output_transcript.delta', delta: '明天', start_ms: 0, end_ms: 200 })
+  protocol.normalizeIncoming({ type: 'session.output_transcript.delta', delta: '有雨。', start_ms: 200, end_ms: 400 })
+  t.mock.timers.tick(800)
+  assert.deepEqual(emitted, [
+    { type: 'response.output_audio_transcript.done', response_id: opened[0].response_id, transcript: '明天有雨。' },
+    { type: 'response.done', response: { id: opened[0].response_id, status: 'completed' }, response_id: opened[0].response_id, __voicePlayback: true },
+  ])
+  protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: pcmFrame({ amplitude: 3000 }) })
+  emitted.length = 0
+  t.mock.timers.tick(800)
+  assert.deepEqual(emitted.map(event => event.type), ['response.done'], 'the next segment starts with an empty transcript')
+})
+
+function segmentHarness(t, options = {}) {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  let clock = 0
+  const emitted = []
+  let protocol = null
+  protocol = createGptLive1Protocol({
+    emit: event => emitted.push(...[].concat(protocol.normalizeIncoming(event))),
+    outputIdleMs: 800,
+    voiceOwedMs: 4000,
+    now: () => clock,
+    ...options,
+  })
+  protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  const wait = ms => {
+    for (let step = 0; step < ms; step += 100) {
+      clock += 100
+      t.mock.timers.tick(100)
+    }
+  }
+  const frames = (amplitude, count) => {
+    const out = []
+    for (let i = 0; i < count; i += 1) {
+      out.push(...protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: pcmFrame({ amplitude }) }))
+      wait(100)
+    }
+    return out
+  }
+  const backend = nested => protocol.normalizeIncoming({ type: 'response.event', delegation_id: 'del_1', event: nested })
+  const doneIds = () => emitted.filter(event => event.type === 'response.done' && event.__voicePlayback).map(event => event.response_id)
+  return { protocol, emitted, wait, frames, backend, doneIds }
+}
+
+test('GPT-Live 1 keeps a filler, the tool wait and the spoken result in one response', t => {
+  const { protocol, frames, backend, wait, doneIds } = segmentHarness(t)
+  protocol.encodeOutgoing({ type: 'response.create' })
+  const filler = frames(3000, 5)
+  const voiceId = filler[0].response_id
+  backend({ type: 'response.created', response: { id: 'resp_1' } })
+  frames(0, 20)
+  backend({ type: 'response.output_item.done', item: { type: 'function_call', call_id: 'call_1', name: 'web_search', arguments: '{}' } })
+  backend({ type: 'response.completed', response: { id: 'resp_1', status: 'completed' } })
+  frames(0, 50)
+  assert.deepEqual(doneIds(), [], 'held while the tool result is outstanding, longer than the owed window')
+  protocol.encodeOutgoing(protocol.conversationItemCreate(protocol.functionOutputItem('call_1', { ok: true })))
+  protocol.encodeOutgoing({ type: 'response.create' })
+  backend({ type: 'response.created', response: { id: 'resp_2' } })
+  backend({ type: 'response.completed', response: { id: 'resp_2', status: 'completed' } })
+  frames(0, 5)
+  assert.deepEqual(doneIds(), [], 'held until the voice layer speaks the result')
+  const answer = frames(3000, 10)
+  assert.ok(answer.every(event => event.response_id === voiceId), 'the result continues the same response')
+  wait(900)
+  assert.deepEqual(doneIds(), [voiceId], 'closed once, after the result was spoken')
+})
+
+test('GPT-Live 1 closes a held segment when the owed result is never spoken', t => {
+  const { protocol, frames, backend, wait, doneIds } = segmentHarness(t)
+  protocol.encodeOutgoing({ type: 'response.create' })
+  const filler = frames(3000, 3)
+  backend({ type: 'response.created', response: { id: 'resp_1' } })
+  backend({ type: 'response.completed', response: { id: 'resp_1', status: 'completed' } })
+  wait(3000)
+  assert.deepEqual(doneIds(), [])
+  wait(1700)
+  assert.deepEqual(doneIds(), [filler[0].response_id])
+})
+
+async function until(predicate, timeoutMs = 3000) {
+  const deadline = performance.now() + timeoutMs
+  while (!predicate()) {
+    assert.ok(performance.now() < deadline, 'condition timed out')
+    await new Promise(resolve => setTimeout(resolve, 5))
+  }
+}
+
+// A GPT-Live 1 service stand-in: answers session.start and records each
+// connection's messages and whether it closed.
+async function liveMockServer(t, onMessage = () => {}) {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+  await new Promise(resolve => server.once('listening', resolve))
+  const connections = []
+  server.on('connection', socket => {
+    const connection = { socket, received: [], closed: false }
+    connections.push(connection)
+    socket.on('close', () => { connection.closed = true })
+    socket.on('message', raw => {
+      const message = JSON.parse(raw.toString())
+      connection.received.push(message)
+      if (message.type === 'session.start') {
+        socket.send(JSON.stringify({ type: 'session.started', session: { id: `sess_${connections.length}` } }))
+      }
+      onMessage(message, connection)
+    })
+  })
+  withConfig(t, {
+    gptLive1ApiKey: 'live-test',
+    gptLive1Model: 'gpt-live-1',
+    gptLive1RealtimeUrl: `ws://127.0.0.1:${server.address().port}/v1/live/sessions`,
+  })
+  t.after(async () => {
+    for (const connection of connections) connection.socket.terminate()
+    await new Promise(resolve => server.close(resolve))
+  })
+  return { connections }
+}
+
+test('GPT-Live 1 idle close is off by default and floored when enabled', t => {
+  withEnv(t, { GPT_LIVE_1_IDLE_CLOSE_MS: undefined })
+  assert.equal(gptLive1Provider.idleCloseMs(), 0)
+  for (const [value, expected] of [['0', 0], ['-1', 0], ['off', 0], ['3000', 10000], ['30000', 30000], ['30000.7', 30000]]) {
+    process.env.GPT_LIVE_1_IDLE_CLOSE_MS = value
+    assert.equal(gptLive1Provider.idleCloseMs(), expected, value)
+  }
+  assert.throws(() => validateRealtimeProvider({ ...gptLive1Provider, idleCloseMs: 30000 }), /idleCloseMs/)
+})
+
+test('GPT-Live 1 stops the silence keepalive as soon as the client closes the session', t => {
+  const { protocol, advance, silenceMs } = keepaliveHarness(t)
+  protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  advance(200)
+  assert.equal(silenceMs().length, 2)
+  assert.deepEqual(protocol.sessionClose(), { type: 'session.close' })
+  advance(1000)
+  assert.equal(silenceMs().length, 2, 'no silence after session.close')
+})
+
+test('GPT-Live 1 swallows two refused silence appends, reports the third once and stops the keepalive', t => {
+  t.mock.timers.enable({ apis: ['setInterval'] })
+  let clock = 0
+  const appended = []
+  let protocol = null
+  protocol = createGptLive1Protocol({
+    // Encoded as the runtime does, so each append carries its own event_id.
+    send: payload => {
+      const encoded = protocol.encodeOutgoing(payload)
+      appended.push(encoded)
+      return encoded
+    },
+    now: () => clock,
+    inputKeepaliveMs: 100,
+    inputKeepaliveGapMs: 500,
+    outputIdleMs: 0,
+  })
+  const advance = ms => {
+    for (let step = 0; step < ms; step += 100) {
+      clock += 100
+      t.mock.timers.tick(100)
+    }
+  }
+  const refuse = append => protocol.normalizeIncoming({
+    type: 'error',
+    error: { type: 'invalid_request_error', code: 'invalid_audio', message: 'Invalid audio', client_event_id: append.event_id },
+  })
+  protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  advance(300)
+  assert.equal(appended.length, 3)
+  assert.deepEqual(refuse(appended[0]), [], 'a refused silence append does not fail the turn')
+  assert.deepEqual(refuse(appended[1]), [])
+  const reported = refuse(appended[2])
+  assert.equal(reported.type, 'error')
+  assert.equal(reported.error.code, 'invalid_audio')
+  advance(1000)
+  assert.equal(appended.length, 3, 'the keepalive stopped after reporting')
+  const unrelated = protocol.normalizeIncoming({ type: 'error', error: { code: 'unknown_field', message: 'x', client_event_id: 'event_other' } })
+  assert.equal(unrelated.type, 'error', 'other command errors still pass through')
+})
+
+test('GPT-Live 1 protocol is quiescent only with nothing in flight on either layer', t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  let clock = 0
+  let protocol = null
+  protocol = createGptLive1Protocol({
+    emit: event => protocol.normalizeIncoming(event),
+    outputIdleMs: 800,
+    inputIdleMs: 1500,
+    voiceOwedMs: 4000,
+    now: () => clock,
+  })
+  const backend = (delegationId, nested) => protocol.normalizeIncoming({
+    type: 'response.event', delegation_id: delegationId, event: nested,
+  })
+  protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  assert.equal(protocol.isQuiescent(), true)
+
+  protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: pcmFrame({ amplitude: 3000 }) })
+  assert.equal(protocol.isQuiescent(), false, 'a spoken segment is open')
+  t.mock.timers.tick(800)
+  assert.equal(protocol.isQuiescent(), true, 'the segment closed on idle')
+
+  protocol.normalizeIncoming({ type: 'session.input_transcript.delta', delta: '你好', start_ms: 5000, end_ms: 5400 })
+  assert.equal(protocol.isQuiescent(), false, 'a user utterance is open')
+  t.mock.timers.tick(1500)
+  assert.equal(protocol.isQuiescent(), true, 'the utterance completed on idle')
+
+  protocol.normalizeIncoming({ type: 'session.delegation.created', delegation: { id: 'del_1', response_id: 'resp_1' } })
+  assert.equal(protocol.isQuiescent(), false, 'a delegation is running')
+  backend('del_1', { type: 'response.completed', response: { id: 'resp_1', status: 'completed' } })
+  assert.equal(protocol.isQuiescent(), false, 'the voice layer still owes the result')
+  clock += 4000
+  assert.equal(protocol.isQuiescent(), true, 'the owed window passed')
+
+  protocol.encodeOutgoing({ type: 'response.create' })
+  assert.equal(protocol.isQuiescent(), false, 'a backend response was requested')
+  backend('del_2', { type: 'response.created', response: { id: 'resp_2' } })
+  assert.equal(protocol.isQuiescent(), false, 'a nested backend response is running')
+  backend('del_2', { type: 'response.output_item.done', item: { type: 'function_call', call_id: 'call_1', name: 'web_search', arguments: '{}' } })
+  backend('del_2', { type: 'response.completed', response: { id: 'resp_2', status: 'completed' } })
+  clock += 4000
+  assert.equal(protocol.isQuiescent(), false, 'a tool result is outstanding')
+  protocol.encodeOutgoing(protocol.conversationItemCreate(protocol.functionOutputItem('call_1', { ok: true })))
+  assert.equal(protocol.isQuiescent(), true, 'the tool result was returned')
+
+  const say = protocol.encodeOutgoing(protocol.responseCreate({ __liveSay: '晚饭好了' }))
+  assert.equal(protocol.isQuiescent(), false, 'a speak request awaits its acknowledgement')
+  protocol.normalizeIncoming({ type: 'session.commentary.appended', client_event_id: say.event_id })
+  assert.equal(protocol.isQuiescent(), true)
+
+  protocol.encodeOutgoing(protocol.conversationItemCreate({ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'context' }] }))
+  assert.equal(protocol.isQuiescent(), true, 'a context-only item leaves nothing in flight')
+})
+
+test('GPT-Live 1 frontend counts commands and events as activity, not the idle output stream or keepalive', { timeout: 10000 }, async t => {
+  withEnv(t, { GPT_LIVE_1_OUTPUT_IDLE_MS: '40' })
+  const { connections } = await liveMockServer(t)
+  const frontend = new RealtimeFrontend({ provider: gptLive1Provider, agentContext: {}, onEvent: () => {}, responseStartTimeoutMs: 1000 })
+  t.after(() => frontend.close())
+  await frontend.connect()
+  const settledAt = frontend.lastActivityAt
+  const { socket } = connections[0]
+  for (let elapsed = 0; elapsed < 300; elapsed += 20) {
+    socket.send(JSON.stringify({ type: 'session.usage.updated', usage: {} }))
+    socket.send(JSON.stringify({ type: 'session.output_audio.delta', delta: pcmFrame({ ms: 20 }) }))
+    await new Promise(resolve => setTimeout(resolve, 20))
+  }
+  assert.ok(connections[0].received.some(message => message.type === 'session.input_audio.append'), 'the keepalive ran meanwhile')
+  assert.equal(frontend.lastActivityAt, settledAt, 'silence, usage and keepalive are not activity')
+  frontend.appendAudio(pcmFrame({ ms: 20 }))
+  assert.ok(frontend.lastActivityAt > settledAt, 'microphone audio is, even when quiet')
+  const audioAt = frontend.lastActivityAt
+  await new Promise(resolve => setTimeout(resolve, 2))
+  frontend.setInputMuted(true)
+  assert.ok(frontend.lastActivityAt > audioAt, 'a command is')
+  const commandAt = frontend.lastActivityAt
+  socket.send(JSON.stringify({ type: 'session.output_audio.delta', delta: pcmFrame({ amplitude: 3000 }) }))
+  await until(() => frontend.lastActivityAt > commandAt)
+})
+
+test('GPT-Live 1 frontend is not quiescent while a text request is queued or its answer is still spoken', { timeout: 10000 }, async t => {
+  withEnv(t, { GPT_LIVE_1_OUTPUT_IDLE_MS: '40' })
+  await liveMockServer(t, (message, { socket }) => {
+    if (message.type !== 'response.create') return
+    const send = event => socket.send(JSON.stringify(event))
+    send({ type: 'response.event', delegation_id: 'del_1', event: { type: 'response.created', response: { id: 'resp_1' } } })
+    send({ type: 'response.event', delegation_id: 'del_1', event: { type: 'response.completed', response: { id: 'resp_1', status: 'completed' } } })
+    send({ type: 'session.output_audio.delta', delta: pcmFrame() })
+    send({ type: 'session.output_audio.delta', delta: pcmFrame({ amplitude: 3000 }) })
+  })
+  const frontend = new RealtimeFrontend({ provider: gptLive1Provider, agentContext: {}, onEvent: () => {}, responseStartTimeoutMs: 2000 })
+  t.after(() => frontend.close())
+  await frontend.connect()
+  assert.equal(frontend.isQuiescent(), true)
+  const outcome = frontend.sendUserText('明天会下雨吗')
+  assert.equal(frontend.isQuiescent(), false, 'queued')
+  assert.equal((await outcome).completed, true)
+  await until(() => frontend.isQuiescent())
+  frontend.close()
+  assert.equal(frontend.isQuiescent(), false, 'a closed frontend is not ready')
+})
+
+test('an idle GPT-Live 1 session parks and wakes on the next request without client-visible state changes', { timeout: 10000 }, async t => {
+  const { connections } = await liveMockServer(t)
+  const provider = { ...gptLive1Provider, idleCloseMs: () => 50 }
+  const states = []
+  const readies = []
+  const logs = []
+  const session = new RealtimeProviderSession({
+    providerRegistry: { resolve: () => provider },
+    defaultProvider: 'gpt-live-1',
+    getAgentContext: () => ({}),
+    shouldReconnect: () => true,
+    onEvent: () => {},
+    onDiagnostic: () => {},
+    onConnected: () => {},
+    onReady: (_frontend, info) => readies.push(info),
+    onDisconnected: () => states.push({ state: 'disconnected' }),
+    onReconnected: () => {},
+    onConnectionState: state => states.push(state),
+    onError: error => states.push({ state: 'error', message: error.message }),
+    onReconnectError: () => {},
+    logger: { info: (name, fields) => logs.push([name, fields]), warn: () => {}, error: () => {} },
+    idleCloseBlocker: () => '',
+  })
+  t.after(() => session.close())
+  await session.ensure()
+  await until(() => session.parked)
+  await until(() => connections[0].closed)
+  assert.ok(connections[0].received.some(message => message.type === 'session.close'), 'closed with session.close')
+  assert.ok(logs.some(([name]) => name === 'realtime.parked'))
+  await new Promise(resolve => setTimeout(resolve, 300))
+  assert.equal(connections.length, 1, 'no reconnect after a park')
+  assert.deepEqual(states.map(state => state.state), ['connecting', 'connected'])
+
+  await session.ensure()
+  assert.equal(connections.length, 2)
+  assert.equal(connections[1].received[0].type, 'session.start')
+  assert.deepEqual(states.map(state => state.state), ['connecting', 'connected'], 'the wake is invisible')
+  assert.deepEqual(readies, [{ resumedFromPark: false }, { resumedFromPark: true }])
+  assert.equal(session.parked, false)
+  assert.ok(logs.some(([name, fields]) => name === 'realtime.connected' && fields.resumedFromPark === true))
+})
+
+test('GPT-Live 1 settles a text request on its backend response, not on the voice layer speaking', { timeout: 10000 }, async t => {
+  withConfig(t, { gptLive1ApiKey: 'live-test', gptLive1Model: 'gpt-live-1' })
+  withEnv(t, { GPT_LIVE_1_DELEGATION_MODEL: 'gpt-5.6-terra', GPT_LIVE_1_OUTPUT_IDLE_MS: '40' })
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+  await new Promise(resolve => server.once('listening', resolve))
+  let backendDoneAt = 0
+  server.once('connection', socket => {
+    socket.on('message', raw => {
+      const message = JSON.parse(raw.toString())
+      if (message.type === 'session.start') {
+        socket.send(JSON.stringify({ type: 'session.started', session: { id: 'sess_1' } }))
+      } else if (message.type === 'response.create') {
+        // The voice layer starts a filler before the backend response exists.
+        socket.send(JSON.stringify({ type: 'session.output_audio.delta', delta: pcmFrame({ amplitude: 3000 }) }))
+        setTimeout(() => {
+          socket.send(JSON.stringify({ type: 'response.event', delegation_id: 'del_1', event: { type: 'response.created', response: { id: 'resp_1' } } }))
+          socket.send(JSON.stringify({ type: 'response.event', delegation_id: 'del_1', event: { type: 'response.completed', response: { id: 'resp_1', status: 'completed' } } }))
+          backendDoneAt = performance.now()
+        }, 50)
+      }
+    })
+  })
+  withConfig(t, { gptLive1RealtimeUrl: `ws://127.0.0.1:${server.address().port}/v1/live/sessions` })
+  const frontend = new RealtimeFrontend({ provider: gptLive1Provider, agentContext: {}, onEvent: () => {}, responseStartTimeoutMs: 2000 })
+  t.after(async () => {
+    frontend.close()
+    await new Promise(resolve => server.close(resolve))
+  })
+  await frontend.connect()
+  const outcome = await Promise.race([
+    frontend.sendUserText('明天天气怎么样'),
+    new Promise(resolve => setTimeout(() => resolve('timeout'), 1500)),
+  ])
+  assert.notEqual(outcome, 'timeout', 'a tool result queued behind this request would wait for the voice layer to finish')
+  assert.equal(outcome.completed, true)
+  assert.ok(performance.now() - backendDoneAt < 500)
+  assert.equal(frontend.playbackResponses.size, 1, 'the spoken segment is still open, owed the result')
+})
+
+function relayHarness(t) {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  let clock = 0
+  const sent = []
+  const emitted = []
+  let protocol = null
+  protocol = createGptLive1Protocol({
+    emit: event => emitted.push(...[].concat(protocol.normalizeIncoming(event))),
+    send: payload => {
+      const encoded = protocol.encodeOutgoing(payload)
+      sent.push(encoded)
+      return encoded
+    },
+    inputKeepaliveMs: 0,
+    outputIdleMs: 800,
+    voiceOwedMs: 4000,
+    resultRelayMs: 2000,
+    now: () => clock,
+  })
+  protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  const wait = ms => {
+    for (let step = 0; step < ms; step += 100) {
+      clock += 100
+      t.mock.timers.tick(100)
+    }
+  }
+  const frame = amplitude => protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: pcmFrame({ amplitude }) })
+  const backend = nested => protocol.normalizeIncoming({ type: 'response.event', delegation_id: 'del_1', event: nested })
+  const finishBackend = text => {
+    protocol.encodeOutgoing({ type: 'response.create' })
+    backend({ type: 'response.created', response: { id: 'resp_1' } })
+    backend({ type: 'response.output_text.delta', delta: text.slice(0, 3) })
+    backend({ type: 'response.output_text.done', text })
+    backend({ type: 'response.completed', response: { id: 'resp_1', status: 'completed' } })
+  }
+  const relays = () => sent.filter(payload => payload.type === 'session.commentary.append')
+  return { protocol, emitted, wait, frame, finishBackend, relays }
+}
+
+test('GPT-Live 1 relays a completed backend result the voice layer leaves unspoken', t => {
+  const { protocol, emitted, wait, finishBackend, relays } = relayHarness(t)
+  finishBackend('上海今天有小雨，出门带伞。')
+  wait(1900)
+  assert.deepEqual(relays(), [])
+  wait(200)
+  assert.equal(relays().length, 1)
+  assert.equal(relays()[0].content, '上海今天有小雨，出门带伞。')
+  assert.equal(relays()[0].delegation_id, null)
+  const id = relays()[0].event_id
+  assert.deepEqual(protocol.normalizeIncoming({ type: 'error', error: { code: 'x', message: 'refused', client_event_id: id } }), [], 'a refused relay does not fail the turn')
+  assert.equal(emitted.filter(event => event.type === 'error').length, 0)
+})
+
+test('GPT-Live 1 keeps a relay acknowledgement internal', t => {
+  const { protocol, wait, finishBackend, relays } = relayHarness(t)
+  finishBackend('结果')
+  wait(2100)
+  assert.deepEqual(protocol.normalizeIncoming({ type: 'session.commentary.appended', client_event_id: relays()[0].event_id }), [], 'the relay is not a speak request')
+})
+
+test('GPT-Live 1 does not relay a result the voice layer speaks or is speaking', t => {
+  const spoken = relayHarness(t)
+  spoken.finishBackend('结果')
+  spoken.frame(0)
+  spoken.wait(300)
+  spoken.frame(3000)
+  spoken.wait(2000)
+  assert.deepEqual(spoken.relays(), [], 'the voice layer started speaking the result')
+
+  t.mock.timers.reset()
+  const speaking = relayHarness(t)
+  speaking.frame(3000)
+  speaking.finishBackend('结果')
+  for (let i = 0; i < 20; i += 1) {
+    speaking.frame(3000)
+    speaking.wait(100)
+  }
+  assert.deepEqual(speaking.relays(), [], 'still talking straight into the result')
+})
+
+test('GPT-Live 1 records a cancelled segment\'s transcript once, apart from the next answer', async t => {
+  const { protocol, emitted, frames, backend, wait } = segmentHarness(t)
+  const transcripts = () => emitted
+    .filter(event => event.type === 'response.output_audio_transcript.done')
+    .map(event => [event.response_id, event.transcript])
+  protocol.encodeOutgoing({ type: 'response.create' })
+  backend({ type: 'response.created', response: { id: 'resp_1' } })
+  const cut = frames(3000, 2)[0].response_id
+  protocol.normalizeIncoming({ type: 'session.output_transcript.delta', delta: 'Let me check.' })
+  frames(0, 10)
+  // A new press interrupts playback while the backend still works.
+  protocol.responseCancel()
+  await new Promise(resolve => queueMicrotask(resolve))
+  assert.deepEqual(emitted.map(event => [event.type, event.response_id]), [
+    ['response.output_audio_transcript.done', cut],
+    ['response.done', cut],
+  ], 'what was heard is recorded before the cancel closes it')
+  backend({ type: 'response.completed', response: { id: 'resp_1', status: 'completed' } })
+  frames(0, 5)
+  const answer = frames(3000, 2)[0].response_id
+  protocol.normalizeIncoming({ type: 'session.output_transcript.delta', delta: 'It is sunny.' })
+  wait(900)
+  assert.notEqual(answer, cut)
+  assert.deepEqual(transcripts(), [[cut, 'Let me check.'], [answer, 'It is sunny.']], 'the next answer starts clean')
+
+  // A quiet onset frame held before the cancel does not lead the next answer.
+  frames(60, 1)
+  protocol.responseCancel()
+  const next = protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: pcmFrame({ amplitude: 3000 }) })
+  assert.deepEqual(next.map(event => event.type), ['response.created', 'response.output_audio.delta'])
+})
+
+test('GPT-Live 1 keeps the result in the filler\'s response when the backend completes between filler words', t => {
+  const { protocol, frames, backend, wait, doneIds } = segmentHarness(t)
+  protocol.encodeOutgoing({ type: 'response.create' })
+  backend({ type: 'response.created', response: { id: 'resp_1' } })
+  const voiceId = frames(3000, 3)[0].response_id
+  frames(0, 1)
+  backend({ type: 'response.completed', response: { id: 'resp_1', status: 'completed' } })
+  // The filler goes on with one-frame pauses between words, then ends.
+  frames(3000, 3)
+  frames(0, 1)
+  frames(3000, 2)
+  frames(0, 12)
+  assert.deepEqual(doneIds(), [], 'a pause between filler words is not the result starting')
+  const answer = frames(3000, 5)
+  assert.ok(answer.every(event => event.response_id === voiceId), 'the result continues the filler\'s response')
+  wait(900)
+  assert.deepEqual(doneIds(), [voiceId])
+})
+
+test('GPT-Live 1 counts a pause already under way at completion toward the result onset', t => {
+  const { protocol, frames, backend, wait, doneIds } = segmentHarness(t)
+  protocol.encodeOutgoing({ type: 'response.create' })
+  backend({ type: 'response.created', response: { id: 'resp_1' } })
+  const voiceId = frames(3000, 3)[0].response_id
+  frames(0, 10)
+  backend({ type: 'response.completed', response: { id: 'resp_1', status: 'completed' } })
+  frames(0, 1)
+  frames(3000, 3)
+  wait(900)
+  assert.deepEqual(doneIds(), [voiceId], 'the result began: the segment closes after it, not after the owed window')
+})
+
+test('GPT-Live 1 relays the result when only the filler went on past the backend\'s completion', t => {
+  const filler = relayHarness(t)
+  filler.frame(3000)
+  filler.finishBackend('结果')
+  for (const amplitude of [3000, 0, 3000, 3000]) {
+    filler.wait(100)
+    filler.frame(amplitude)
+  }
+  for (let i = 0; i < 16; i += 1) {
+    filler.wait(100)
+    filler.frame(0)
+  }
+  assert.equal(filler.relays().length, 1, 'a pause between filler words is not the result being spoken')
+
+  t.mock.timers.reset()
+  const spoken = relayHarness(t)
+  spoken.frame(3000)
+  spoken.finishBackend('结果')
+  for (const amplitude of [3000, 0, 0, 0, 0, 0, 3000, 3000, 3000]) {
+    spoken.wait(100)
+    spoken.frame(amplitude)
+  }
+  spoken.wait(1300)
+  assert.deepEqual(spoken.relays(), [], 'speech after a sustained pause is the result')
+})
+
+test('GPT-Live 1 stops holding a spoken segment after 20 s without speech and traces it', t => {
+  const lines = []
+  const { protocol, frames, backend, doneIds } = segmentHarness(t, { trace: line => lines.push(line) })
+  protocol.encodeOutgoing({ type: 'response.create' })
+  backend({ type: 'response.created', response: { id: 'resp_1' } })
+  const filler = frames(3000, 3)[0].response_id
+  // The tool handler fails without returning an output: the call stays unanswered.
+  backend({ type: 'response.output_item.done', item: { type: 'function_call', call_id: 'call_1', name: 'recall', arguments: '{}' } })
+  backend({ type: 'response.completed', response: { id: 'resp_1', status: 'completed' } })
+  frames(0, 195)
+  assert.deepEqual(doneIds(), [], 'held while the call is unanswered')
+  frames(0, 10)
+  assert.deepEqual(doneIds(), [filler], 'released once 20 s passed without speech')
+  assert.ok(lines.some(line => line.includes('"type":"gpt-live-1.hold_expired"')), 'the release is traced')
+  const next = frames(3000, 3)[0].response_id
+  frames(0, 10)
+  assert.deepEqual(doneIds(), [filler, next], 'the stale call does not hold the next answer')
+  assert.equal(protocol.isQuiescent(), true)
+})
+
+test('GPT-Live 1 stops waiting on backend work the service refused or closed', t => {
+  const refused = segmentHarness(t)
+  refused.protocol.encodeOutgoing({ type: 'response.create' })
+  refused.backend({ type: 'response.created', response: { id: 'resp_1' } })
+  const voiceId = refused.frames(3000, 3)[0].response_id
+  refused.backend({ type: 'response.output_item.done', item: { type: 'function_call', call_id: 'call_1', name: 'recall', arguments: '{}' } })
+  refused.backend({ type: 'response.completed', response: { id: 'resp_1', status: 'completed' } })
+  refused.frames(0, 50)
+  const create = refused.protocol.encodeOutgoing({ type: 'response.create' })
+  refused.protocol.normalizeIncoming({
+    type: 'error',
+    error: { type: 'invalid_request_error', code: 'invalid_request', message: 'function call outputs required', client_event_id: create.event_id },
+  })
+  refused.frames(0, 10)
+  assert.deepEqual(refused.doneIds(), [voiceId], 'a refused response.create continues nothing')
+  assert.equal(refused.protocol.isQuiescent(), true)
+
+  t.mock.timers.reset()
+  const closed = segmentHarness(t)
+  closed.protocol.encodeOutgoing({ type: 'response.create' })
+  closed.backend({ type: 'response.created', response: { id: 'resp_1' } })
+  closed.backend({ type: 'response.output_item.done', item: { type: 'function_call', call_id: 'call_1', name: 'recall', arguments: '{}' } })
+  closed.backend({ type: 'response.completed', response: { id: 'resp_1', status: 'completed' } })
+  closed.protocol.encodeOutgoing({ type: 'response.create' })
+  assert.equal(closed.protocol.isQuiescent(), false)
+  assert.deepEqual(closed.protocol.normalizeIncoming({ type: 'session.closed', reason: 'expired' }), [])
+  assert.equal(closed.protocol.isQuiescent(), true, 'nothing is awaited after the session closed')
+})
+
+function spontaneousHarness(t) {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  let clock = 20000
+  const protocol = createGptLive1Protocol({
+    emit: () => {}, inputKeepaliveMs: 0, outputIdleMs: 800, dropSpontaneousSpeech: true, now: () => clock,
+  })
+  protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  const voiced = () => protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: pcmFrame({ amplitude: 3000 }) })
+  const words = () => protocol.normalizeIncoming({ type: 'session.output_transcript.delta', delta: '嗯' })
+  const advance = ms => { clock += ms; t.mock.timers.tick(ms) }
+  return { protocol, voiced, words, advance }
+}
+
+test('GPT-Live 1 drops speech the voice layer starts on its own for a text-only client with nothing pending', t => {
+  const { voiced, words } = spontaneousHarness(t)
+  assert.deepEqual(voiced(), [], 'a stray backchannel would reach the earbud as a notification')
+  assert.deepEqual(words(), [], 'and its caption would open a response of its own')
+})
+
+test('GPT-Live 1 still speaks for a pending request, a speaking microphone, and an acknowledged speak request', t => {
+  const requested = spontaneousHarness(t)
+  requested.protocol.encodeOutgoing({ type: 'response.create' })
+  assert.equal(requested.voiced()[0].type, 'response.created', 'a request is pending')
+
+  t.mock.timers.reset()
+  const microphone = spontaneousHarness(t)
+  microphone.protocol.encodeOutgoing(microphone.protocol.audioAppend('AAAA'))
+  microphone.advance(2000)
+  assert.equal(microphone.voiced()[0].type, 'response.created', 'a full-duplex client may be answered at any time')
+
+  t.mock.timers.reset()
+  const speak = spontaneousHarness(t)
+  const say = speak.protocol.encodeOutgoing({ type: 'session.commentary.append', delegation_id: null, content: '该喝水了' })
+  speak.protocol.normalizeIncoming({ type: 'session.commentary.appended', client_event_id: say.event_id })
+  speak.advance(1000)
+  assert.equal(speak.voiced()[0].type, 'response.created', 'the acknowledged announcement is spoken after its ack')
 })

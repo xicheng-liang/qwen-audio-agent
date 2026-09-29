@@ -50,6 +50,20 @@ test('confirms task notifications when client playback starts', () => {
   }), false)
 })
 
+test('confirms a due reminder when client playback starts', () => {
+  assert.equal(confirmsTaskNotificationOnPlaybackStart({
+    origin: 'gateway-system-event',
+    taskIds: ['task_1'],
+  }), true, 'otherwise the reminder is announced again after every acknowledgement timeout')
+  assert.equal(confirmsTaskNotificationOnPlaybackStart({
+    origin: 'gateway-system-event',
+    taskId: 'task_1',
+  }), true)
+  assert.equal(confirmsTaskNotificationOnPlaybackStart({
+    origin: 'gateway-system-event',
+  }), false, 'a system event about no task confirms nothing')
+})
+
 test('accepts playback receipts only from the active output client for a known response', () => {
   assert.equal(acceptsPlaybackReceipt({
     outputEnabled: true,

@@ -29,6 +29,8 @@ OPENAI_API_KEY=your-openai-key
 | `GPT_LIVE_1_OUTPUT_IDLE_MS` | `800` | Silence after which a spoken segment counts as finished |
 | `GPT_LIVE_1_TRACE_EVENTS` | Empty | `1` logs every Live API event in both directions to stderr as shapes, ids, codes and sizes; conversation content (prompts, transcripts, tool output, audio) is replaced by its length (integration debugging) |
 | `GPT_LIVE_1_TOOL_OUTPUT_MAX_BYTES` | Empty | Hard cap on one backend input item (a tool result, typed text). By default an item may use half of what is left of the session's backend input budget |
+| `GPT_LIVE_1_IDLE_CLOSE_MS` | `0` (off) | Closes the Live session after this long with nothing in flight and reopens it on the next request, because the service bills for the time a session is open. Values below `10000` are raised to `10000` |
+| `GPT_LIVE_1_DROP_SPONTANEOUS_SPEECH` | off | Set to `1` to drop speech the voice layer starts on its own while a text-only client (no input audio for 10 s) has nothing pending, such as a stray backchannel after an answer |
 
 Desktop exposes the endpoint, key, model, and voice fields under
 **Voice frontend → GPT-Live 1**. Restart a terminal Gateway after editing the
@@ -102,6 +104,15 @@ name a text-model deployment on the same resource. The adapter sends the same
   requests waiting on it keep running, and the backend's tool calls are
   answered even after a new user turn, because the service refuses
   `response.create` while a call is unanswered.
+- With `GPT_LIVE_1_IDLE_CLOSE_MS` set, an idle session is closed with
+  `session.close` and reopened by the next request: typed text, a task result
+  or reminder, a permission or input request, or a Gateway delivery. It never
+  closes while a turn, playback, tool call, backend task or announcement is
+  open. The client connection stays up and sees no connection or state event;
+  the first request after a close waits for one connect, and the new session
+  starts from the seeded text history without that request, which it receives
+  as input. Backend items of the closed session, such as tool outputs, are not
+  carried over. If reopening fails, only the request that needed it fails.
 - Beyond that seeded history no pre-connection context is injected, and live
   visual frames are not negotiated for this provider.
 
@@ -111,8 +122,8 @@ Local protocol tests cover session configuration, the client event encoding,
 segmentation of spoken output, synthesised input turns, the delegated
 function-call loop, the backend input budget with its repair path, the
 full-duplex turn rules (late fragments, barge-in, cancel and tool-call
-survival), announcement acknowledgement, idle closing, and a mock-service
-connection. Live model
+survival), announcement acknowledgement, idle closing, closing and reopening an idle
+session, and a mock-service connection. Live model
 behavior, voices, latency, quotas, and regional availability require a valid
 account and are governed by OpenAI's current Live API documentation.
 

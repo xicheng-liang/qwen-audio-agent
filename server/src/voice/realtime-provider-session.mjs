@@ -3,6 +3,11 @@ import { ReconnectBackoff } from './reconnect-backoff.mjs'
 import { RealtimeConfigurationError } from './realtime-errors.mjs'
 import { realtimeConnectionStatus } from './realtime-connection-status.mjs'
 
+// How often a blocked idle close is checked again.
+const IDLE_CLOSE_RECHECK_MS = 1000
+// setTimeout fires at once for longer delays.
+const MAX_TIMER_MS = 2 ** 31 - 1
+
 /**
  * Owns one provider-facing realtime Session lifecycle.
  *
@@ -32,6 +37,9 @@ export class RealtimeProviderSession {
     stableConnectionMs = 10_000,
     createFrontend = createRealtimeFrontend,
     reconnectBackoff = new ReconnectBackoff(),
+    // '' when an idle provider session may close, otherwise the reason it may not.
+    idleCloseBlocker = () => 'disabled',
+    now = () => performance.now(),
   }) {
     this.providerRegistry = providerRegistry
     this.providerKey = providerRegistry.resolve(defaultProvider).key
@@ -61,6 +69,13 @@ export class RealtimeProviderSession {
     this.connectedAt = 0
     this.blockedError = ''
     this.inputMuted = false
+    this.idleCloseBlocker = idleCloseBlocker
+    this.now = now
+    // Parked: the provider session was closed while idle and reopens on the
+    // next request, with no connection state change reported to the client.
+    this.parked = false
+    this.idleTimer = null
+    this.idleBlocker = ''
   }
 
   get ready() {
@@ -182,10 +197,14 @@ export class RealtimeProviderSession {
     if (this.blockedError) return Promise.reject(new Error(this.blockedError))
     if (this.ready) return Promise.resolve()
     if (this.connectPromise) return this.connectPromise
-    this.onConnectionState({
-      state: 'connecting',
-      provider: this.providerKey,
-    })
+    // Stays parked until ready, so concurrent wakes share this attempt.
+    const resumedFromPark = this.parked
+    if (!resumedFromPark) {
+      this.onConnectionState({
+        state: 'connecting',
+        provider: this.providerKey,
+      })
+    }
     const connectStartedAt = Date.now()
     this.logger.info('realtime.connecting', { provider: this.providerKey })
     let createdFrontend
@@ -209,23 +228,28 @@ export class RealtimeProviderSession {
     createdConnectPromise = createdFrontend.connect()
       .then(() => {
         if (this.frontend !== createdFrontend) return
+        this.parked = false
         this.blockedError = ''
         this.connectedAt = Date.now()
         this.logger.info('realtime.connected', {
           provider: createdFrontend.provider.key,
           durationMs: this.connectedAt - connectStartedAt,
+          ...(resumedFromPark ? { resumedFromPark } : {}),
         })
-        this.onConnectionState({
-          state: 'connected',
-          provider: createdFrontend.provider.key,
-        })
+        if (!resumedFromPark) {
+          this.onConnectionState({
+            state: 'connected',
+            provider: createdFrontend.provider.key,
+          })
+        }
         this.onConnected(createdFrontend)
         this.pendingAudio.forEach(audio => createdFrontend.appendAudio(audio))
         this.pendingAudio = []
         if (this.pendingImage) createdFrontend.appendImage(this.pendingImage)
         this.pendingImage = null
         createdFrontend.setInputMuted?.(this.inputMuted)
-        this.onReady(createdFrontend)
+        this.onReady(createdFrontend, { resumedFromPark })
+        this.#armIdleClose()
       })
       .catch(error => {
         if (this.frontend !== createdFrontend) return
@@ -242,6 +266,21 @@ export class RealtimeProviderSession {
           this.clearPendingAudio()
           this.clearPendingImage()
         }
+        if (resumedFromPark && classification !== 'fatal') {
+          // A transient wake failure costs the request that woke it, not the link:
+          // stay parked, report no connection state, and let the caller report it.
+          this.frontend = null
+          this.parked = true
+          createdFrontend.close()
+          this.logger.warn('realtime.unpark_failed', {
+            provider: createdFrontend.provider.key,
+            classification,
+            error,
+          })
+          throw error
+        }
+        // A fatal wake leaves the park and reports unavailable, so the client rebuilds the link.
+        this.parked = false
         if (classification !== 'capacity_busy') {
           this.onConnectionState({
             state: 'unavailable',
@@ -284,8 +323,12 @@ export class RealtimeProviderSession {
       this.blockedError = error.message
       this.clearPendingAudio()
       this.clearPendingImage()
+      // Fatal even during a wake: the park ends and the unavailable state reports it.
+      this.parked = false
       error.realtimeConnectionReported = true
     }
+    // During a wake the request that woke the session reports the failure once.
+    if (this.parked) return
     if (classification !== 'inactivity' && classification !== 'capacity_busy') {
       this.reportError(error)
     }
@@ -293,6 +336,8 @@ export class RealtimeProviderSession {
 
   #handleClose(createdFrontend) {
     if (this.frontend !== createdFrontend) return
+    // Only a wake still connecting can close while parked; its rejection reports it.
+    if (this.parked) return
     const connectedMs = this.connectedAt ? Date.now() - this.connectedAt : 0
     this.logger.warn('realtime.closed', {
       provider: createdFrontend.provider.key,
@@ -351,7 +396,59 @@ export class RealtimeProviderSession {
     scheduled.resolve()
   }
 
+  // Arms the idle check; only a provider that defines idleCloseMs ever parks.
+  #armIdleClose(delay) {
+    clearTimeout(this.idleTimer)
+    this.idleTimer = null
+    const idleMs = Number(this.frontend?.provider?.idleCloseMs?.()) || 0
+    if (!(idleMs > 0)) return
+    this.idleTimer = setTimeout(() => this.#checkIdle(idleMs), Math.min(delay ?? idleMs, MAX_TIMER_MS))
+    this.idleTimer.unref?.()
+  }
+
+  #checkIdle(idleMs) {
+    this.idleTimer = null
+    const frontend = this.frontend
+    if (!frontend?.ready || this.connectPromise || this.scheduledReconnect || this.blockedError) return
+    // A frontend that does not track activity never parks.
+    const lastActivityAt = frontend.lastActivityAt
+    if (typeof lastActivityAt !== 'number' || Number.isNaN(lastActivityAt)) return
+    const quietMs = this.now() - lastActivityAt
+    if (quietMs < idleMs) return this.#armIdleClose(idleMs - quietMs)
+    let blocker = 'frontend_busy'
+    try {
+      if (frontend.isQuiescent?.() === true) blocker = String(this.idleCloseBlocker() || '')
+    } catch {
+      blocker = 'blocker_threw'
+    }
+    if (blocker) {
+      // Logged when the reason changes, not on every recheck.
+      if (blocker !== this.idleBlocker) this.logger.info('realtime.idle_close_blocked', { reason: blocker })
+      this.idleBlocker = blocker
+      return this.#armIdleClose(IDLE_CLOSE_RECHECK_MS)
+    }
+    this.#park(quietMs)
+  }
+
+  // Closes the idle provider session without a reconnect or any client event.
+  // detach() clears this.frontend first, so the closing socket's late
+  // close/error/events are dropped by the identity guards.
+  #park(quietMs) {
+    this.logger.info('realtime.parked', {
+      provider: this.frontend.provider.key,
+      quietMs: Math.round(quietMs),
+      connectedMs: this.connectedAt ? Date.now() - this.connectedAt : 0,
+    })
+    this.detach({ clearAudio: false })
+    this.connectedAt = 0
+    this.idleBlocker = ''
+    this.parked = true
+  }
+
   detach({ clearAudio = true, notifyDisconnected = false } = {}) {
+    this.parked = false
+    clearTimeout(this.idleTimer)
+    this.idleTimer = null
     if (clearAudio) this.clearPendingAudio()
     // Visual frames are point-in-time context. Never carry one across a
     // provider rebuild, even when reconnecting preserves queued microphone

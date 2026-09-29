@@ -212,6 +212,9 @@ export function validateRealtimeProvider(provider) {
       `Realtime Provider ${provider.key} 的 responseStartTimeoutMs 必须是正数`,
     )
   }
+  if (provider.idleCloseMs !== undefined && typeof provider.idleCloseMs !== 'function') {
+    throw new Error(`Realtime Provider ${provider.key} idleCloseMs 必须是函数`)
+  }
   if (provider.createProtocol !== undefined) {
     if (typeof provider.createProtocol !== 'function') {
       throw new Error(

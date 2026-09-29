@@ -111,6 +111,13 @@ const DEFAULT_CAPABILITIES = Object.freeze({
   concurrentVoicePlayback: false,
 })
 const DEFAULT_RESPONSE_CANCEL_GRACE_MS = 1_000
+// Input events that count as session activity for idle close.
+const INPUT_ACTIVITY_TYPES = new Set([
+  'input_audio_buffer.speech_started',
+  'input_audio_buffer.speech_stopped',
+  'conversation.item.input_audio_transcription.delta',
+  'conversation.item.input_audio_transcription.completed',
+])
 
 export class RealtimeFrontend {
   constructor({
@@ -140,7 +147,7 @@ export class RealtimeFrontend {
         emit: event => this.emitProviderEvent(event),
         // A protocol may also send a wire event of its own, e.g. to replace a
         // tool result the service rejected before the runtime's next command.
-        send: payload => this.send(payload),
+        send: (payload, options) => this.send(payload, options),
       }) ?? provider.protocol,
       provider.key || provider.label,
     )
@@ -173,6 +180,10 @@ export class RealtimeFrontend {
     this.idleWaiters = []
     this.outputQueue = Promise.resolve()
     this.responseQueueGeneration = 0
+    // Monotonic time of the last command or response/input event (not audio
+    // frames: the Live output stream never stops), and queued work not yet settled.
+    this.lastActivityAt = performance.now()
+    this.queueDepth = 0
     this.responseStartTimeoutMs = responseStartTimeoutMs
       ?? this.provider.responseStartTimeoutMs
       ?? 30000
@@ -314,6 +325,9 @@ export class RealtimeFrontend {
       this.protocol.normalizeIncoming(providerEvent),
     )
     for (const event of events) {
+      if (isResponseActivityEvent(event) || INPUT_ACTIVITY_TYPES.has(event.type)) {
+        this.lastActivityAt = performance.now()
+      }
       if (event.type === 'error' && this.restoringContext) {
         event.__voiceOrigin = 'restore'
       }
@@ -397,6 +411,7 @@ export class RealtimeFrontend {
   }
 
   appendAudio(audio) {
+    this.lastActivityAt = performance.now()
     this.send(this.protocol.audioAppend(audio), { audio: true })
     this.audioInputStarted = true
   }
@@ -826,8 +841,21 @@ export class RealtimeFrontend {
       if (!this.ready || generation !== this.responseQueueGeneration) return
       await action()
     }
-    this.outputQueue = this.outputQueue.then(run, run)
+    const tracked = this.trackQueued(run)
+    this.outputQueue = this.outputQueue.then(tracked, tracked)
     return this.outputQueue
+  }
+
+  // Counts queued work until it settles; the queue chain still adopts run's
+  // own promise, so ordering and rejections are unchanged.
+  trackQueued(run) {
+    this.queueDepth += 1
+    const settle = () => { this.queueDepth -= 1 }
+    return () => {
+      const result = run()
+      result.then(settle, settle)
+      return result
+    }
   }
 
   enqueueResponse(origin, context, create) {
@@ -888,7 +916,8 @@ export class RealtimeFrontend {
       }
       return outcome
     }
-    this.outputQueue = this.outputQueue.then(run, run)
+    const tracked = this.trackQueued(run)
+    this.outputQueue = this.outputQueue.then(tracked, tracked)
     return this.outputQueue
   }
 
@@ -975,7 +1004,9 @@ export class RealtimeFrontend {
         if (index >= 0) {
           pending = this.pendingResponses.splice(index, 1)[0]
         }
-      } else {
+      } else if (!event.__unsolicited) {
+        // Speech the service starts on its own is not the reply to a request:
+        // settling the request on it would queue tool results behind the speech.
         const index = this.pendingResponses.findIndex(item => item.responseRequested)
         if (index >= 0) pending = this.pendingResponses.splice(index, 1)[0]
       }
@@ -1214,6 +1245,15 @@ export class RealtimeFrontend {
     return this.activeResponses.size - this.playbackResponses.size > 0
   }
 
+  // Nothing pending on this connection, playback included (unlike whenIdle,
+  // which ignores concurrent voice playback).
+  isQuiescent() {
+    return this.ready && this.activeResponses.size === 0 && this.pendingResponses.length === 0
+      && this.retryingResponses.size === 0 && this.responseWaiters.size === 0
+      && this.conversationItemWaiters.size === 0 && this.queueDepth === 0
+      && !this.responseSlot.blocked && this.protocol.isQuiescent?.() !== false
+  }
+
   async whenIdle() {
     while (this.responseSlot.blocked || this.gatingResponsesActive()) {
       if (this.responseSlot.blocked) await this.responseSlot.wait()
@@ -1277,6 +1317,8 @@ export class RealtimeFrontend {
 
   send(payload, options = {}) {
     if (!payload) return
+    // Microphone audio counts in appendAudio; keepalive silence never counts.
+    if (!options.audio) this.lastActivityAt = performance.now()
     if (this.ws?.readyState === WebSocket.OPEN) {
       let outgoing = payload
       if (payload.type === 'response.create' && this.pendingResponses.length) {

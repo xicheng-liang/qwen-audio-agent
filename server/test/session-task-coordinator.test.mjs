@@ -324,3 +324,147 @@ test('user Task kinds share result delivery while system jobs stay outside the f
   assert.equal(h.injectCalls.length, 3)
   assert.equal(h.events.length, count)
 })
+
+const settle = async () => {
+  for (let i = 0; i < 10; i += 1) await new Promise(resolve => setImmediate(resolve))
+}
+
+async function advance(t, ms) {
+  t.mock.timers.tick(ms)
+  await settle()
+}
+
+// A parked session on mocked timers. Its wakes fail until wakeSucceeds is set;
+// a successful wake runs the ready hooks the runtime runs.
+function parkedCoordinator(t) {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const h = harness(t)
+  Object.assign(h.state, { ready: false, parked: true })
+  const wakes = []
+  let inflight = null
+  h.wakeSucceeds = false
+  h.coordinator.onUnpark = reason => {
+    if (inflight) return inflight
+    inflight = Promise.resolve().then(() => {
+      wakes.push(reason)
+      inflight = null
+      if (!h.wakeSucceeds) throw new Error('socket hang up')
+      Object.assign(h.state, { ready: true, parked: false })
+      h.coordinator.announcePendingPermissions()
+      h.coordinator.announcePendingInputs()
+      h.coordinator.claimPendingNotifications()
+    })
+    // Observed here too, so an ignored failure fails an assertion, not the process.
+    inflight.catch(() => {})
+    return inflight
+  }
+  return Object.assign(h, { wakes })
+}
+
+async function completedWhileParked(t) {
+  const h = parkedCoordinator(t)
+  const run = await startTask(h)
+  run.complete({ content: 'time to leave' })
+  await h.taskManager.wait(run.task.id)
+  await settle()
+  assert.equal(h.wakes.length, 1, 'the completion wakes the session once')
+  return { h, run }
+}
+
+test('a failed proactive wake is retried after 2, 4 and 8 s, then left for the next wake', async t => {
+  const { h, run } = await completedWhileParked(t)
+  for (const delay of [2000, 4000, 8000]) {
+    const before = h.wakes.length
+    await advance(t, delay - 1)
+    assert.equal(h.wakes.length, before, `not before ${delay} ms`)
+    await advance(t, 1)
+    assert.equal(h.wakes.length, before + 1, `retried after ${delay} ms`)
+  }
+  await advance(t, 120_000)
+  assert.equal(h.wakes.length, 4, 'three retries at most')
+  assert.deepEqual(h.errors, [], 'no client-visible error')
+  assert.equal(h.injectCalls.length, 0)
+  assert.equal(h.taskManager.get(run.task.id).notificationStatus, 'pending', 'still claimable later')
+  assert.equal(h.coordinator.wakeRetryTimer, null)
+})
+
+test('a retried wake that succeeds delivers through the ready hooks and stops retrying', async t => {
+  const { h } = await completedWhileParked(t)
+  await advance(t, 2000)
+  assert.equal(h.wakes.length, 2)
+  h.wakeSucceeds = true
+  await advance(t, 4000)
+  await advance(t, 0)
+  assert.equal(h.wakes.length, 3)
+  assert.deepEqual(h.injectCalls.map(call => call.origin), ['announcement'])
+  await advance(t, 120_000)
+  assert.equal(h.wakes.length, 3)
+
+  Object.assign(h.state, { ready: false, parked: true })
+  h.wakeSucceeds = false
+  const next = await startTask(h)
+  next.complete({ content: 'second result' })
+  await h.taskManager.wait(next.task.id)
+  await settle()
+  assert.equal(h.wakes.length, 4)
+  await advance(t, 2000)
+  assert.equal(h.wakes.length, 5, 'a later failure starts from 2 s again')
+})
+
+test('work that arrives during the backoff waits for the scheduled retry', async t => {
+  const { h } = await completedWhileParked(t)
+  const run = await startTask(h)
+  permission(run)
+  await advance(t, 1999)
+  assert.equal(h.wakes.length, 1, 'no extra wake inside the backoff')
+  h.wakeSucceeds = true
+  await advance(t, 1)
+  await advance(t, 0)
+  assert.equal(h.wakes.length, 2)
+  assert.deepEqual(h.injectCalls.map(call => call.origin).sort(), ['announcement', 'permission'])
+})
+
+test('a permission request whose wake failed is asked once a retried wake succeeds', async t => {
+  const h = parkedCoordinator(t)
+  const run = await startTask(h)
+  permission(run)
+  await settle()
+  assert.equal(h.wakes.length, 1)
+  h.wakeSucceeds = true
+  await advance(t, 2000)
+  assert.equal(h.wakes.length, 2)
+  assert.deepEqual(h.injectCalls.map(call => call.origin), ['permission'])
+})
+
+test('wake retries stop once nothing is undelivered, the session is not parked, or it closes', async t => {
+  const cases = {
+    'claimed elsewhere': (h, run) => h.taskManager.claimNotifications({
+      ownerId: h.ownerId, sessionId: h.sessionId, claimantId: 'elsewhere', taskIds: [run.task.id],
+    }),
+    'no longer parked': h => { h.state.parked = false },
+    'reset on disconnect': h => h.coordinator.resetPresentation(),
+    closed: h => h.coordinator.close(),
+  }
+  for (const [name, stop] of Object.entries(cases)) {
+    await t.test(name, async st => {
+      const { h, run } = await completedWhileParked(st)
+      stop(h, run)
+      if (['reset on disconnect', 'closed'].includes(name)) assert.equal(h.coordinator.wakeRetryTimer, null, name)
+      await advance(st, 120_000)
+      assert.equal(h.wakes.length, 1, name)
+    })
+  }
+})
+
+test('a retry that stops because the session was woken leaves a full budget for the next park', async t => {
+  const { h, run } = await completedWhileParked(t)
+  h.state.parked = false
+  await advance(t, 2000)
+  assert.equal(h.wakes.length, 1)
+  h.state.parked = true
+  h.coordinator.claimPendingNotifications([run.task.id])
+  await settle()
+  assert.equal(h.wakes.length, 2)
+  await advance(t, 2000)
+  assert.equal(h.wakes.length, 3, 'retried after 2 s again')
+})

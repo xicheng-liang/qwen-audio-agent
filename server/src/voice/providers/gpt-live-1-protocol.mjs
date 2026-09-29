@@ -41,6 +41,54 @@ const INPUT_IDLE_EVENT = 'gpt-live-1.input_idle'
 // for Gateway-initiated speech (task results, permission prompts).
 export const DEFAULT_OUTPUT_IDLE_MS = 800
 const OUTPUT_IDLE_EVENT = 'gpt-live-1.output_idle'
+// The session timeline advances only while input audio arrives. Without it
+// (a text-only client, a muted or idle microphone) appends stay unacknowledged
+// and the voice layer never speaks, so once no real audio has been sent for
+// the gap, real-time PCM16 silence is appended on every tick.
+export const DEFAULT_INPUT_KEEPALIVE_MS = 100
+export const DEFAULT_INPUT_KEEPALIVE_GAP_MS = 500
+const INPUT_KEEPALIVE_MAX_FILL_MS = 1000
+// One answer is one spoken segment: a filler said while the backend works and
+// the result spoken after it must not become two responses, because a client
+// that ends its turn on the first finished response would lose the result. The
+// segment stays open while backend work is outstanding and, after the backend
+// completes, until the voice layer starts speaking again or this long passes.
+export const DEFAULT_VOICE_OWED_MS = 4000
+// Speech after this much consecutive silent output is a new utterance; a
+// shorter pause is a gap between words of the one already under way.
+const OUTPUT_ONSET_PAUSE_MS = 400
+// A hold with no spoken frame for this long is stale bookkeeping (a tool call
+// never answered, a refusal that named no command): the segment is let go.
+const VOICE_HOLD_MAX_QUIET_MS = 20000
+// The voice layer occasionally leaves a completed backend result unspoken. With
+// no spoken onset this long after completion, the result text is handed to it
+// as commentary (measured: not spoken twice when the voice was already on it).
+export const DEFAULT_RESULT_RELAY_MS = 2000
+// With dropSpontaneousSpeech, a text-only client (no real input audio this long)
+// asks nothing between its requests: speech the voice layer starts with nothing
+// pending would reach it as a stray notification, so it is dropped.
+const SPONTANEOUS_INPUT_QUIET_MS = 10000
+const RESULT_RELAY_QUIET_MS = 700
+const BACKEND_TEXT_MAX_CHARS = 4000
+// While the timeline runs the service streams output audio continuously,
+// silence included, so missing deltas never mark the end of speech. A frame
+// below this RMS is silence: outside a spoken segment it is not played, and
+// inside one it does not extend the segment. Measured: silence 0-96, speech
+// frames 690 and up. Frames shorter than the minimum are not judged.
+const OUTPUT_SILENCE_RMS = 150
+const OUTPUT_SILENCE_MIN_SAMPLES = 240
+
+function silentPcm16(base64) {
+  const pcm = Buffer.from(String(base64 || ''), 'base64')
+  const samples = Math.floor(pcm.length / 2)
+  if (samples < OUTPUT_SILENCE_MIN_SAMPLES) return false
+  let sum = 0
+  for (let offset = 0; offset < samples * 2; offset += 2) {
+    const value = pcm.readInt16LE(offset)
+    sum += value * value
+  }
+  return Math.sqrt(sum / samples) < OUTPUT_SILENCE_RMS
+}
 // The three append events accept at most 500 tokens. Estimate tokens
 // conservatively (a CJK character is about one token, other text about four
 // characters per token) and clamp below the limit rather than have the
@@ -301,8 +349,53 @@ export function createGptLive1Protocol({
   backendInputMaxItems = DEFAULT_BACKEND_INPUT_MAX_ITEMS,
   onStartupError = null,
   standingInstructions = [],
+  inputKeepaliveMs = DEFAULT_INPUT_KEEPALIVE_MS,
+  inputKeepaliveGapMs = DEFAULT_INPUT_KEEPALIVE_GAP_MS,
+  inputSampleRate = 24000,
+  outputSampleRate = 24000,
+  voiceOwedMs = DEFAULT_VOICE_OWED_MS,
+  resultRelayMs = DEFAULT_RESULT_RELAY_MS,
+  dropSpontaneousSpeech = false,
+  now = () => performance.now(),
 } = {}) {
   let voiceResponseId = ''
+  // Output transcript of the open spoken segment. The runtime records the
+  // assistant turn from transcript.done; without it history holds only the
+  // user's side and a new session answers old questions again.
+  let voiceTranscript = ''
+  // Timeline keepalive: when real input audio was last sent, when silence was
+  // last appended, and whether the append in flight is ours.
+  let keepaliveTimer = null
+  let lastRealAudioAt = -Infinity
+  let lastFillAt = -Infinity
+  let fillingSilence = false
+  // event_ids of silence appends: a rejected one must not fail the open turn.
+  const keepaliveIds = new Set()
+  let keepaliveRejections = 0
+  // The last silent output frame dropped outside a segment, replayed ahead of
+  // the next spoken frame so a soft onset is not clipped.
+  let heldSilentDelta = ''
+  // Backend work the spoken segment waits for: a response.create not yet
+  // answered, function calls whose outputs qaa has not returned, and a
+  // completed result the voice layer has not started to speak.
+  let awaitingBackend = false
+  const pendingFunctionCalls = new Set()
+  let voiceOwedUntil = 0
+  let quietSinceBackendDone = false
+  // Consecutive silent output in audio ms: since the last spoken frame, and
+  // since the backend's completion.
+  let silentRunMs = 0
+  let silentSinceDoneMs = 0
+  let lastVoicedAt = -Infinity
+  let voiceOpenedAt = -Infinity
+  // Result relay: backend output text per response, the pending relay, and the
+  // relay commentary ids, whose acks and errors stay internal.
+  const backendText = new Map()
+  let relayTimer = null
+  let relaying = false
+  const relayIds = new Set()
+  // A speak request acknowledged: its speech may start after the ack.
+  let speakOwedUntil = 0
   // When the current or last spoken answer began on the session timeline. The
   // OpenAI primary WebSocket sends audio without timing, so this also comes
   // from output transcript deltas; NaN until either arrives.
@@ -410,6 +503,37 @@ export function createGptLive1Protocol({
     return true
   }
 
+  const stopKeepalive = () => {
+    clearInterval(keepaliveTimer)
+    keepaliveTimer = null
+  }
+
+  // Fills the wall-clock time since the last audio of either kind, capped so a
+  // stalled timer cannot burst. A failed send means the socket is gone.
+  const keepaliveTick = () => {
+    const at = now()
+    if (at - lastRealAudioAt < inputKeepaliveGapMs) return
+    const fillMs = Math.min(at - Math.max(lastRealAudioAt, lastFillAt), INPUT_KEEPALIVE_MAX_FILL_MS)
+    const samples = Math.round(inputSampleRate * fillMs / 1000)
+    if (!(samples > 0)) return
+    lastFillAt = at
+    fillingSilence = true
+    let sent
+    try {
+      sent = send({ type: 'session.input_audio.append', audio: Buffer.alloc(samples * 2).toString('base64') }, { audio: true })
+    } finally {
+      fillingSilence = false
+    }
+    if (!sent) stopKeepalive()
+  }
+
+  const startKeepalive = () => {
+    if (keepaliveTimer || typeof send !== 'function' || !(inputKeepaliveMs > 0)) return
+    lastFillAt = now()
+    keepaliveTimer = setInterval(keepaliveTick, inputKeepaliveMs)
+    keepaliveTimer.unref?.()
+  }
+
   const trackResponses = normalized => {
     for (const event of [].concat(normalized ?? [])) {
       const responseId = event?.response?.id || event?.response_id
@@ -458,12 +582,83 @@ export function createGptLive1Protocol({
     inputIdleTimer.unref?.()
   }
 
+  const clearRelay = () => {
+    clearTimeout(relayTimer)
+    relayTimer = null
+  }
+
+  const scheduleRelay = text => {
+    clearRelay()
+    const content = clampCommentary(String(text || '').trim())
+    if (!content || typeof send !== 'function' || !(resultRelayMs > 0)) return
+    relayTimer = setTimeout(() => {
+      relayTimer = null
+      // Spoken already, or speaking right now: leave it to the voice layer.
+      if (!voiceOwedUntil || now() - lastVoicedAt < RESULT_RELAY_QUIET_MS) return
+      voiceOwedUntil = now() + voiceOwedMs
+      quietSinceBackendDone = true
+      relaying = true
+      try {
+        send({ type: 'session.commentary.append', delegation_id: null, content })
+      } finally {
+        relaying = false
+      }
+    }, resultRelayMs)
+    relayTimer.unref?.()
+  }
+
+  const holdVoiceSegment = () => backendResponses.size > 0
+    || awaitingBackend
+    || pendingFunctionCalls.size > 0
+    || now() < voiceOwedUntil
+
+  const spontaneous = () => dropSpontaneousSpeech
+    && !voiceResponseId
+    && now() - lastRealAudioAt > SPONTANEOUS_INPUT_QUIET_MS
+    && !holdVoiceSegment()
+    && commentaryRequests.size === 0
+    && !relayTimer
+    && !(now() < speakOwedUntil)
+
+  const pcm16Ms = base64 => Buffer.byteLength(String(base64 || ''), 'base64') / 2 / outputSampleRate * 1000
+
+  // A spoken frame after a sustained pause following the backend's completion
+  // is the voice layer speaking the result: nothing is owed any more.
+  const noteOutputFrame = (silent, ms) => {
+    silentRunMs = silent ? silentRunMs + ms : 0
+    if (!voiceOwedUntil) return
+    if (silent) {
+      silentSinceDoneMs += ms
+      if (silentSinceDoneMs >= OUTPUT_ONSET_PAUSE_MS) quietSinceBackendDone = true
+    } else if (quietSinceBackendDone) voiceOwedUntil = 0
+    else silentSinceDoneMs = 0
+  }
+
+  // Lets go of every hold reason, so stale bookkeeping cannot hold later answers.
+  const expireHold = quietMs => {
+    if (trace) {
+      trace(traceLine('--', {
+        type: 'gpt-live-1.hold_expired',
+        response_id: voiceResponseId,
+        quiet_ms: Math.round(quietMs),
+        awaiting_backend: awaitingBackend,
+        backend_responses: backendResponses.size,
+        pending_function_calls: pendingFunctionCalls.size,
+      }))
+    }
+    awaitingBackend = false
+    pendingFunctionCalls.clear()
+    backendResponses.clear()
+    voiceOwedUntil = 0
+  }
+
   const openVoiceResponse = (events, startMs = NaN) => {
     if (voiceResponseId) {
       if (!Number.isFinite(answerStartMs) && Number.isFinite(startMs)) answerStartMs = startMs
       return voiceResponseId
     }
     voiceResponseId = id('voice')
+    voiceOpenedAt = now()
     answerStartMs = Number.isFinite(startMs) ? startMs : NaN
     answeredSinceInput = true
     events.push({
@@ -471,13 +666,23 @@ export function createGptLive1Protocol({
       response: { id: voiceResponseId, status: 'in_progress' },
       response_id: voiceResponseId,
       __voicePlayback: true,
+      // The voice layer speaks on its own; no client request is answered by it.
+      __unsolicited: true,
     })
     return voiceResponseId
   }
 
+  // The open segment's transcript as a final event; null when nothing was said.
+  const voiceTranscriptDone = () => (voiceResponseId && voiceTranscript.trim()
+    ? { type: 'response.output_audio_transcript.done', response_id: voiceResponseId, transcript: voiceTranscript }
+    : null)
+
   const finishVoiceResponse = (events, status = 'completed') => {
     clearOutputIdle()
     if (!voiceResponseId) return
+    const transcriptDone = voiceTranscriptDone()
+    if (transcriptDone) events.push(transcriptDone)
+    voiceTranscript = ''
     events.push({
       type: 'response.done',
       response: { id: voiceResponseId, status },
@@ -541,6 +746,7 @@ export function createGptLive1Protocol({
     switch (nested?.type) {
       case 'response.created':
       case 'response.in_progress':
+        awaitingBackend = false
         // A response continued after tool results may resume with in_progress
         // and no created event; open it then, once.
         if (nested.type === 'response.in_progress' && openResponses.has(responseId)) return []
@@ -554,6 +760,7 @@ export function createGptLive1Protocol({
         // carries call_id/name. The arguments-done twin has no call_id in the
         // Responses stream, so a bare one here is that duplicate: drop it.
         if (!nested.call_id) return []
+        pendingFunctionCalls.add(nested.call_id)
         return [{
           type: 'response.function_call_arguments.done',
           response_id: responseId,
@@ -564,6 +771,7 @@ export function createGptLive1Protocol({
       case 'response.output_item.done': {
         const item = nested.item || {}
         if (item.type !== 'function_call') return []
+        if (item.call_id) pendingFunctionCalls.add(item.call_id)
         return [{
           type: 'response.function_call_arguments.done',
           response_id: responseId,
@@ -577,6 +785,12 @@ export function createGptLive1Protocol({
       case 'response.incomplete':
         delegationResponses.delete(delegationId)
         backendResponses.delete(responseId)
+        voiceOwedUntil = now() + voiceOwedMs
+        // Quiet already: no spoken segment, or one in a sustained pause.
+        quietSinceBackendDone = !voiceResponseId || silentRunMs >= OUTPUT_ONSET_PAUSE_MS
+        silentSinceDoneMs = 0
+        scheduleRelay(backendText.get(responseId))
+        backendText.delete(responseId)
         return [{
           type: 'response.done',
           response: {
@@ -587,6 +801,8 @@ export function createGptLive1Protocol({
         }]
       case 'response.failed':
       case 'error':
+        awaitingBackend = false
+        backendText.delete(responseId)
         delegationResponses.delete(delegationId)
         backendResponses.delete(responseId)
         // With the id the runtime releases this response; without it the
@@ -597,8 +813,14 @@ export function createGptLive1Protocol({
           error: nested.error || nested.response?.error || { message: 'GPT-Live 1 backend response failed' },
           response_id: responseId,
         }]
-      // Backend text/reasoning deltas are not spoken directly; the voice layer
-      // speaks. They carry no user-facing audio, so drop them.
+      // Backend text is not spoken directly; the voice layer speaks. It is kept
+      // only as the relay's fallback content.
+      case 'response.output_text.delta':
+        if (responseId) backendText.set(responseId, `${backendText.get(responseId) || ''}${nested.delta || ''}`.slice(0, BACKEND_TEXT_MAX_CHARS))
+        return []
+      case 'response.output_text.done':
+        if (responseId && typeof nested.text === 'string') backendText.set(responseId, nested.text.slice(0, BACKEND_TEXT_MAX_CHARS))
+        return []
       default:
         return []
     }
@@ -618,6 +840,7 @@ export function createGptLive1Protocol({
     switch (event?.type) {
       case 'session.started':
         started = true
+        startKeepalive()
         return { type: 'session.created', session: { id: event.session?.id || null } }
 
       // session.update acks carry nothing the runtime needs; usage and the
@@ -634,25 +857,44 @@ export function createGptLive1Protocol({
         const events = []
         const startMs = Number(event.start_ms)
         if (interruptedTail(startMs, Number(event.end_ms))) return events
+        const silent = silentPcm16(event.delta)
+        if (!silent) lastVoicedAt = now()
+        noteOutputFrame(silent, pcm16Ms(event.delta))
+        if (silent && !voiceResponseId) {
+          heldSilentDelta = event.delta || ''
+          return events
+        }
+        if (spontaneous()) {
+          heldSilentDelta = ''
+          return events
+        }
         if (
           voiceResponseId
           && Number.isFinite(startMs)
           && Number.isFinite(lastOutputEndMs)
           && startMs - lastOutputEndMs > OUTPUT_SEGMENT_GAP_MS
+          && !holdVoiceSegment()
         ) {
           finishVoiceResponse(events)
         }
         // The assistant answering ends the user's turn; without this the
         // runtime treats the answer as talking over the user and mutes it.
         commitInput(events)
+        const opening = !voiceResponseId
         const responseId = openVoiceResponse(events, Number(event.start_ms))
         if (Number.isFinite(event.end_ms)) lastOutputEndMs = Number(event.end_ms)
+        if (opening && heldSilentDelta) {
+          events.push({ type: 'response.output_audio.delta', response_id: responseId, delta: heldSilentDelta })
+        }
+        heldSilentDelta = ''
         events.push({
           type: 'response.output_audio.delta',
           response_id: responseId,
           delta: event.delta || '',
         })
-        armOutputIdle()
+        // A pause inside speech is played but does not extend the segment, so
+        // it closes one idle window after the last spoken frame.
+        if (!silent) armOutputIdle()
         return events
       }
 
@@ -661,9 +903,11 @@ export function createGptLive1Protocol({
       // it settles the Gateway's speak request as a finished playback response.
       case 'session.commentary.appended': {
         const clientEventId = String(event.client_event_id || '')
+        if (relayIds.delete(clientEventId)) return []
         const sayId = commentaryRequests.get(clientEventId)
         if (!sayId) return []
         commentaryRequests.delete(clientEventId)
+        speakOwedUntil = now() + voiceOwedMs
         return [
           { type: 'response.created', response: { id: sayId, status: 'in_progress' }, response_id: sayId, __voicePlayback: true },
           { type: 'response.done', response: { id: sayId, status: 'completed' }, response_id: sayId, __voicePlayback: true },
@@ -673,8 +917,10 @@ export function createGptLive1Protocol({
       case 'session.output_transcript.delta': {
         const events = []
         if (interruptedTail(Number(event.start_ms), Number(event.end_ms))) return events
+        if (spontaneous()) return events
         commitInput(events)
         const responseId = openVoiceResponse(events, Number(event.start_ms))
+        voiceTranscript += event.delta || ''
         events.push({
           type: 'response.output_audio_transcript.delta',
           response_id: responseId,
@@ -686,6 +932,14 @@ export function createGptLive1Protocol({
 
       case OUTPUT_IDLE_EVENT: {
         const events = []
+        if (voiceResponseId && holdVoiceSegment()) {
+          const quietMs = now() - Math.max(lastVoicedAt, voiceOpenedAt)
+          if (quietMs < VOICE_HOLD_MAX_QUIET_MS) {
+            armOutputIdle()
+            return events
+          }
+          expireHold(quietMs)
+        }
         finishVoiceResponse(events)
         return events
       }
@@ -770,6 +1024,12 @@ export function createGptLive1Protocol({
         return normalizeBackendEvent(event.event, event.delegation_id)
 
       case 'session.closed': {
+        stopKeepalive()
+        clearRelay()
+        backendText.clear()
+        awaitingBackend = false
+        pendingFunctionCalls.clear()
+        voiceOwedUntil = 0
         const events = []
         completeInput(events)
         finishVoiceResponse(events)
@@ -789,6 +1049,21 @@ export function createGptLive1Protocol({
         const clientEventId = String(error.client_event_id || '')
         if (!started && typeof onStartupError === 'function') onStartupError(error, { session: lastStartSession })
         if (swallowedErrors.delete(clientEventId)) return []
+        // A refused relay leaves the result to the voice layer, as before it.
+        if (relayIds.delete(clientEventId)) return []
+        // Refused silence is reported once, after which the keepalive stops.
+        if (keepaliveIds.delete(clientEventId)) {
+          keepaliveRejections += 1
+          if (keepaliveRejections < 3) return []
+          stopKeepalive()
+          return commandError(error, clientEventId)
+        }
+        // A refused response.create starts no backend work, so the segment no
+        // longer waits on it or on the calls it was to continue.
+        if (responseCommandIds.has(clientEventId) && !sentItems.has(clientEventId)) {
+          awaitingBackend = false
+          pendingFunctionCalls.clear()
+        }
         const sayId = commentaryRequests.get(clientEventId)
         if (sayId) {
           // A rejected commentary fails the speak request it belongs to.
@@ -819,11 +1094,22 @@ export function createGptLive1Protocol({
     encodeOutgoing: payload => {
       if (payload == null) return null
       const encoded = { event_id: eventId(), ...payload }
+      if (payload.type === 'response.create') awaitingBackend = true
+      if (payload.type === 'response.item.create' && payload.item?.type === 'function_call_output') {
+        pendingFunctionCalls.delete(payload.item.call_id)
+      }
       if (payload.type === 'response.create' || payload.type === 'response.item.create') {
         responseCommandIds.add(encoded.event_id)
         if (responseCommandIds.size > 200) responseCommandIds.delete(responseCommandIds.values().next().value)
       }
-      if (payload.type === 'session.commentary.append') remember(commentaryRequests, encoded.event_id, id('say'))
+      if (payload.type === 'session.commentary.append') {
+        if (relaying) {
+          relayIds.add(encoded.event_id)
+          if (relayIds.size > 32) relayIds.delete(relayIds.values().next().value)
+        } else {
+          remember(commentaryRequests, encoded.event_id, id('say'))
+        }
+      }
       if (payload.type === 'response.item.create') {
         const bytes = utf8Bytes(encoded.item)
         ledger.charge(bytes)
@@ -835,6 +1121,11 @@ export function createGptLive1Protocol({
           if (sent) sent.responseCreateId = encoded.event_id
         }
         pendingBatch = []
+      }
+      if (payload.type === 'session.input_audio.append' && !fillingSilence) lastRealAudioAt = now()
+      if (fillingSilence) {
+        keepaliveIds.add(encoded.event_id)
+        if (keepaliveIds.size > 64) keepaliveIds.delete(keepaliveIds.values().next().value)
       }
       if (trace && payload.type !== 'session.input_audio.append') trace(traceLine('>>', encoded))
       return encoded
@@ -867,7 +1158,17 @@ export function createGptLive1Protocol({
       return { type: 'session.update', session: { delegation } }
     },
 
-    sessionClose: () => ({ type: 'session.close' }),
+    sessionClose: () => {
+      stopKeepalive()
+      clearRelay()
+      return { type: 'session.close' }
+    },
+
+    // Nothing in flight on either layer: no spoken segment, user utterance,
+    // speak request, backend work or result the voice layer still owes.
+    isQuiescent: () => !voiceResponseId && !inputItemId && !outputIdleTimer && !inputIdleTimer
+      && commentaryRequests.size === 0 && backendResponses.size === 0 && delegationResponses.size === 0
+      && !awaitingBackend && pendingFunctionCalls.size === 0 && !(now() < voiceOwedUntil) && !relayTimer,
 
     audioAppend: audio => ({ type: 'session.input_audio.append', audio }),
 
@@ -931,15 +1232,21 @@ export function createGptLive1Protocol({
     // The close is delivered asynchronously like a wire event.
     responseCancel: () => {
       clearOutputIdle()
+      // What was heard of the cut segment is recorded once, as on a barge-in,
+      // and none of it is carried into the next answer.
+      const transcriptDone = voiceTranscriptDone()
       voiceResponseId = ''
+      voiceTranscript = ''
+      heldSilentDelta = ''
       lastOutputEndMs = -Infinity
       const cancelled = [...playbackResponses]
       for (const responseId of cancelled) {
         openResponses.delete(responseId)
         playbackResponses.delete(responseId)
       }
-      if (cancelled.length && typeof emit === 'function') {
+      if ((transcriptDone || cancelled.length) && typeof emit === 'function') {
         queueMicrotask(() => {
+          if (transcriptDone) emit(transcriptDone)
           for (const responseId of cancelled) {
             emit({
               type: 'response.done',

@@ -180,6 +180,21 @@ function outputIdleMs() {
   return Number.isFinite(value) && value > 0 ? value : DEFAULT_OUTPUT_IDLE_MS
 }
 
+// Close an idle Live session after this long; the next request reopens it. 0
+// (default) = off. The floor covers the gap before the voice layer speaks a result.
+const MIN_IDLE_CLOSE_MS = 10_000
+
+// Drop speech the voice layer starts on its own while a text-only client has
+// nothing pending (off by default).
+function dropSpontaneousSpeech() {
+  return String(process.env.GPT_LIVE_1_DROP_SPONTANEOUS_SPEECH || '').trim() === '1'
+}
+
+function idleCloseMs() {
+  const value = Number(process.env.GPT_LIVE_1_IDLE_CLOSE_MS)
+  return Number.isFinite(value) && value > 0 ? Math.max(MIN_IDLE_CLOSE_MS, Math.floor(value)) : 0
+}
+
 // Optional hard cap on a single backend input item (a tool result, typed
 // text). Without it an item may use its share of the session budget.
 function backendItemMaxBytes() {
@@ -230,6 +245,7 @@ export const gptLive1Provider = {
   createProtocol: context => createGptLive1Protocol({
     ...context,
     outputIdleMs: outputIdleMs(),
+    dropSpontaneousSpeech: dropSpontaneousSpeech(),
     itemMaxBytes: backendItemMaxBytes(),
     standingInstructions: STANDING_RESPONSE_INSTRUCTIONS,
     onStartupError: (error, { session } = {}) => {
@@ -271,6 +287,7 @@ export const gptLive1Provider = {
     return profiles.some(profile => profile.id === active.id) ? profiles : [...profiles, active]
   },
   voice: () => config.gptLive1Voice || null,
+  idleCloseMs,
   isConfigured: () => Boolean(config.gptLive1ApiKey),
   missingConfigurationMessage: '请先配置 GPT_LIVE_1_API_KEY',
   connectTimeoutMessage: '连接 GPT-Live 1 Live API 超时',

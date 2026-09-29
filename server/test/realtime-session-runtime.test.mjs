@@ -10,18 +10,19 @@ import { TaskOperations } from '../src/orchestration/task-operations.mjs'
 import { clientActionCapabilities, ClientActionName } from '../src/client/client-action-port.mjs'
 import { GatewayClientEvent as Input } from '../../shared/protocol/realtime-events.mjs'
 import { GatewayEventRouter } from '../src/client/client-event-router.mjs'
+import { RealtimeConfigurationError } from '../src/voice/realtime-errors.mjs'
 import { desktopClientTools } from '../../web/src/desktop/client-tools.js'
 
 const tick = () => new Promise(resolve => setImmediate(resolve))
-async function until(predicate) {
-  const deadline = Date.now() + 2000
+async function until(predicate, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs
   while (!predicate()) {
     assert.ok(Date.now() < deadline, 'runtime condition timed out')
     await new Promise(resolve => setTimeout(resolve, 5))
   }
 }
 
-function harness(t, { backend = true, ...overrides } = {}) {
+function harness(t, { backend = true, idleCloseMs, ...overrides } = {}) {
   const ownerId = 'runtime-owner', sessionId = 'conversation'
   const events = [], frontends = [], tasks = [], observations = [], done = []
   const runs = new Map(), memoryListeners = new Set()
@@ -33,7 +34,10 @@ function harness(t, { backend = true, ...overrides } = {}) {
     capabilities: { sessionOutputVoice: true },
     classifyError: message => message === 'input busy' ? 'input_busy'
       : message === 'unsafe' ? 'content_safety' : 'other',
+    ...(idleCloseMs ? { idleCloseMs: () => idleCloseMs } : {}),
   }
+  const connectFailures = []
+  const connectGates = []
   const backendRuntime = {
     run: (_input, execution) => new Promise((resolve, reject) => {
       runs.set(execution.taskId, { ...execution, resolve })
@@ -72,7 +76,12 @@ function harness(t, { backend = true, ...overrides } = {}) {
       const f = {
         provider, ready: false, inputs: [], audio: [], images: [], outputs: [], deliveries: [], updates: [], cancels: 0,
         initialContext: options.agentContext, sessionOptions: options.sessionOptions,
-        async connect() { this.ready = true },
+        lastActivityAt: -Infinity, isQuiescent: () => true,
+        async connect() {
+          if (connectGates.length) await connectGates.shift()
+          if (connectFailures.length) throw connectFailures.shift()
+          this.ready = true
+        },
         close() { this.ready = false },
         cancel() { this.cancels++ }, cancelResponses() {}, clearPendingImage() {},
         appendAudio(value) { this.audio.push(value) },
@@ -110,7 +119,13 @@ function harness(t, { backend = true, ...overrides } = {}) {
     await Promise.all(manager.list({ active: true }).map(task => operations.cancel(task.id, { ownerId })))
   })
   return { runtime, send, connect, request, manager, operations, events, frontends, runs, tasks, observations,
-    done, memoryListeners, provider, conversationSync, ownerId, sessionId }
+    done, memoryListeners, provider, conversationSync, ownerId, sessionId,
+    failNextConnect: error => connectFailures.push(error),
+    holdNextConnect: () => {
+      let release
+      connectGates.push(new Promise(resolve => { release = resolve }))
+      return () => release()
+    } }
 }
 
 test('frontend runtime chats without backend, socket, handshake or provider network', async t => {
@@ -422,4 +437,201 @@ test('rejected restoration quarantines only replay context and stops repeated re
   await new Promise(resolve => setTimeout(resolve, 600))
   assert.equal(h.frontends.length, 3)
   assert.ok(h.events.some(e => e.message?.includes('自动恢复已停止')))
+})
+
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
+const EARBUD = { inputEnabled: false, outputEnabled: true }
+
+// An output-only client whose idle provider session has parked.
+async function parkedRuntime(t, { before = () => {}, ...options } = {}) {
+  const h = harness(t, { idleCloseMs: 20, ...options })
+  before(h)
+  const f = await h.connect(EARBUD)
+  await until(() => f.ready === false)
+  return h
+}
+
+test('an idle output-only session parks without any client event', async t => {
+  const h = await parkedRuntime(t)
+  const readyAt = h.events.findIndex(event => event.type === 'voice.ready')
+  assert.ok(readyAt >= 0)
+  await wait(60)
+  assert.deepEqual(h.events.slice(readyAt + 1), [], 'no voice.connection, voice.state or error')
+  assert.equal(h.runtime.status().state, 'disconnected')
+  assert.equal(h.frontends.length, 1, 'no reconnect')
+})
+
+test('text after a park wakes the session invisibly and sends the request once', async t => {
+  const h = await parkedRuntime(t)
+  const before = h.events.length
+  h.send({ type: Input.TEXT_MESSAGE, text: '明天会下雨吗' })
+  await until(() => h.frontends[1]?.inputs.length === 1)
+  const after = h.events.slice(before)
+  assert.equal(h.frontends.length, 2)
+  assert.equal(after.some(event => event.type === 'voice.ready'), false, 'the client already saw voice.ready')
+  assert.equal(after.some(event => event.type === 'voice.connection'), false)
+  assert.equal(after.some(event => event.type === 'error'), false)
+  assert.equal(h.runtime.status().state, 'connected')
+})
+
+test('a text wake does not seed the waking request as history', async t => {
+  const h = await parkedRuntime(t, {
+    before: h => h.conversationSync.restore({ ownerId: h.ownerId, sessionId: h.sessionId, messages: [
+      { id: 'u1', role: 'user', source: 'text-user', content: 'previous question' },
+      { id: 'a1', role: 'assistant', source: 'realtime-direct', content: 'previous answer' },
+    ] }),
+  })
+  h.send({ type: Input.TEXT_MESSAGE, text: 'current question' })
+  await until(() => h.frontends[1]?.inputs.length === 1)
+  assert.deepEqual(
+    h.frontends[1].initialContext.recentMessages.map(message => message.content),
+    ['previous question', 'previous answer'],
+  )
+  assert.ok(h.conversationSync.frontendContext(h).some(message => message.content === 'current question'), 'kept in history')
+})
+
+test('a context refresh while a text wake connects still leaves the waking request out', async t => {
+  const h = await parkedRuntime(t, {
+    before: h => h.conversationSync.restore({ ownerId: h.ownerId, sessionId: h.sessionId, messages: [
+      { id: 'u1', role: 'user', source: 'text-user', content: 'previous question' },
+      { id: 'a1', role: 'assistant', source: 'realtime-direct', content: 'previous answer' },
+    ] }),
+  })
+  const release = h.holdNextConnect()
+  h.send({ type: Input.TEXT_MESSAGE, text: 'current question' })
+  await until(() => h.frontends.length === 2)
+  h.runtime.setAssistantProfile('brief answers')
+  release()
+  await until(() => h.frontends[1]?.inputs.length === 1)
+  const refreshed = h.frontends[1].updates.at(-1)?.context
+  assert.ok(refreshed, 'the refresh reached the connecting frontend')
+  assert.deepEqual(refreshed.recentMessages.map(message => message.content), ['previous question', 'previous answer'])
+})
+
+test('a task result after a park wakes the session and is announced', async t => {
+  const h = await parkedRuntime(t)
+  const task = h.request('check the weather')
+  await until(() => h.runs.has(task.id))
+  await wait(40)
+  assert.equal(h.frontends.length, 1, 'running work alone does not wake it')
+  h.runs.get(task.id).resolve({ content: 'sunny' })
+  await until(() => h.frontends[1]?.deliveries.some(delivery => delivery.origin === 'announcement'))
+  assert.equal(h.events.filter(event => event.type === 'voice.ready').length, 1)
+  await wait(100)
+  assert.equal(h.frontends[1].ready, true, 'an announcement awaiting its playback receipt keeps the session open')
+})
+
+test('a permission request after a park wakes the session and is asked', async t => {
+  const h = await parkedRuntime(t)
+  const task = h.request('read file')
+  await until(() => h.runs.has(task.id))
+  h.runs.get(task.id).onEvent({ type: 'backend.permission.requested', permission: {
+    id: 'auth-parked', status: 'pending', summary: 'read a file',
+  } })
+  await until(() => h.frontends[1]?.deliveries.some(delivery => delivery.origin === 'permission'))
+  assert.ok(h.frontends[1].initialContext.frontend.capabilities.includes('permission.respond'))
+})
+
+test('an active task or an open turn keeps the provider session open', async t => {
+  const working = harness(t, { idleCloseMs: 50 })
+  const f = await working.connect(EARBUD)
+  const task = working.request('long work')
+  await until(() => working.runs.has(task.id))
+  const talking = harness(t, { idleCloseMs: 50 })
+  const g = await talking.connect(EARBUD)
+  talking.send({ type: Input.TEXT_MESSAGE, text: 'hello' })
+  await until(() => g.inputs.length === 1)
+  await wait(500)
+  assert.equal(f.ready, true, 'active task')
+  assert.equal(g.ready, true, 'turn without a response yet')
+  assert.equal(working.frontends.length + talking.frontends.length, 2)
+
+  g.emit({ type: 'response.created', response: { id: 'reply' } })
+  g.emit({ type: 'response.done', response: { id: 'reply', status: 'completed' } })
+  await until(() => g.ready === false, 3000)
+  const readyAt = talking.events.findIndex(event => event.type === 'voice.ready')
+  assert.equal(talking.events.slice(readyAt + 1).some(event => event.type === 'voice.connection'), false)
+})
+
+test('a client event delivered after a park wakes the session', async t => {
+  const h = await parkedRuntime(t)
+  h.runtime.handleClientDelivery({ delivery: { mode: 'respond', text: 'the build finished', origin: 'client-event' } })
+  await until(() => h.frontends[1]?.deliveries.some(delivery => delivery.origin === 'client-event'))
+  assert.equal(h.events.filter(event => event.type === 'voice.ready').length, 1)
+})
+
+test('a failed text wake fails that turn once and leaves the link usable', async t => {
+  const h = await parkedRuntime(t)
+  const before = h.events.length
+  h.failNextConnect(new Error('upstream refused'))
+  h.send({ type: Input.TEXT_MESSAGE, text: 'first try' })
+  await until(() => h.events.slice(before).some(event => event.type === 'error'))
+  await wait(30)
+  assert.equal(h.events.slice(before).filter(event => event.type === 'error').length, 1)
+  assert.equal(h.frontends[1].inputs.length, 0)
+  h.send({ type: Input.TEXT_MESSAGE, text: 'second try' })
+  await until(() => h.frontends[2]?.inputs.length === 1)
+  assert.equal(h.events.slice(before).some(event => event.type === 'voice.connection'), false, 'never unavailable')
+  assert.equal(h.events.slice(before).filter(event => event.type === 'error').length, 1)
+})
+
+test('a fatal wake failure reports the link unavailable, as a fatal connect does without a park', async t => {
+  const linkEvents = events => events.filter(event => ['voice.connection', 'error'].includes(event.type))
+  const plain = harness(t)
+  plain.failNextConnect(new RealtimeConfigurationError('invalid api key'))
+  plain.runtime.start()
+  plain.send({ type: Input.CONNECT, ...EARBUD }, { descriptor: { type: 'test', instanceId: 'instance' }, capabilities: [] })
+  await until(() => plain.events.some(event => event.type === 'error'))
+  const expected = linkEvents(plain.events).filter(event => event.state !== 'connecting')
+  assert.deepEqual(expected.map(event => event.state || event.type), ['unavailable', 'error'])
+
+  const h = await parkedRuntime(t)
+  const before = h.events.length
+  h.failNextConnect(new RealtimeConfigurationError('invalid api key'))
+  h.send({ type: Input.TEXT_MESSAGE, text: 'first try' })
+  await until(() => h.events.slice(before).some(event => event.type === 'error'))
+  await wait(30)
+  assert.deepEqual(linkEvents(h.events.slice(before)), expected, 'the gateway sees unavailable and rebuilds')
+  assert.equal(h.runtime.status().state, 'unavailable')
+})
+
+test('a failed text wake releases its turn, so a later result is still announced', async t => {
+  const h = await parkedRuntime(t)
+  h.failNextConnect(new Error('upstream refused'))
+  h.send({ type: Input.TEXT_MESSAGE, text: 'first try' })
+  await until(() => h.events.some(event => event.type === 'error'))
+  const task = h.request('check the weather')
+  await until(() => h.runs.has(task.id))
+  h.runs.get(task.id).resolve({ content: 'sunny' })
+  await until(() => h.frontends[2]?.deliveries.some(delivery => delivery.origin === 'announcement'))
+})
+
+test('a failed text wake asks a pending permission again without waiting for a retry', async t => {
+  const h = await parkedRuntime(t)
+  const task = h.request('read file')
+  await until(() => h.runs.has(task.id))
+  const release = h.holdNextConnect()
+  h.failNextConnect(new Error('upstream refused'))
+  h.send({ type: Input.TEXT_MESSAGE, text: 'first try' })
+  await until(() => h.frontends.length === 2)
+  h.runs.get(task.id).onEvent({ type: 'backend.permission.requested', permission: {
+    id: 'auth-waking', status: 'pending', summary: 'read a file',
+  } })
+  release()
+  await until(() => h.events.some(event => event.type === 'error'))
+  await until(() => h.frontends[2]?.deliveries.some(delivery => delivery.origin === 'permission'), 1000)
+})
+
+test('a result whose wake failed is announced by a retried wake, with no client event', async t => {
+  const h = await parkedRuntime(t)
+  const before = h.events.length
+  h.failNextConnect(new Error('socket hang up'))
+  const task = h.request('remind me')
+  await until(() => h.runs.has(task.id))
+  h.runs.get(task.id).resolve({ content: 'time to leave' })
+  await until(() => h.frontends.length === 2)
+  await wait(1500)
+  assert.equal(h.frontends.length, 2, 'no retry before 2 s')
+  await until(() => h.frontends[2]?.deliveries.some(delivery => delivery.origin === 'announcement'), 2000)
+  assert.deepEqual(h.events.slice(before), [], 'the failed wake and its retry stay invisible')
 })

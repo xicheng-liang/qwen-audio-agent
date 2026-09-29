@@ -18,6 +18,8 @@ function harness({
   shouldReconnect = false,
   maxPendingAudioChunks = 2,
   sessionOptions = {},
+  idleCloseMs,
+  ...sessionOverrides
 } = {}) {
   const calls = []
   const frontends = []
@@ -30,6 +32,7 @@ function harness({
       classifyError: message => String(message).includes('invalid')
         ? 'fatal'
         : String(message).includes('busy') ? 'capacity_busy' : 'other',
+      ...(idleCloseMs ? { idleCloseMs: () => idleCloseMs } : {}),
     },
     s2s: {
       key: 's2s',
@@ -52,6 +55,9 @@ function harness({
       options,
       provider: profiles[options.providerName],
       ready: false,
+      lastActivityAt: -Infinity,
+      quiescent: true,
+      isQuiescent: () => frontend.quiescent,
       connect: () => {
         calls.push(['connect', options.providerName])
         if (connectMode === 'resolve') connection.resolve()
@@ -90,7 +96,7 @@ function harness({
     onEvent: event => calls.push(['event', event]),
     onDiagnostic: value => calls.push(['diagnostic', value]),
     onConnected: () => calls.push(['onConnected']),
-    onReady: () => calls.push(['onReady']),
+    onReady: (_frontend, info) => calls.push(['onReady', info]),
     onDisconnected: () => calls.push(['onDisconnected']),
     onReconnected: () => calls.push(['onReconnected']),
     onConnectionState: state => calls.push(['state', state]),
@@ -108,6 +114,7 @@ function harness({
       next: () => 1,
       reset: () => calls.push(['backoff.reset']),
     },
+    ...sessionOverrides,
   })
   return { runtime, calls, frontends }
 }
@@ -341,4 +348,219 @@ test('forwards agent context options down to the frontend', async () => {
   const [, context, options] = calls.find(([name]) => name === 'updateAgentContext')
   assert.deepEqual(context, { memories: [] })
   assert.deepEqual(options, { refreshSession: false }, 'options 必须原样到底层')
+})
+
+const wait = ms => new Promise(resolve => setTimeout(resolve, ms))
+
+async function until(predicate, timeoutMs = 2000) {
+  const deadline = performance.now() + timeoutMs
+  while (!predicate()) {
+    assert.ok(performance.now() < deadline, 'condition timed out')
+    await wait(5)
+  }
+}
+
+const connectionStates = calls => calls.filter(([name]) => name === 'state').map(([, state]) => state.state)
+
+async function parkedHarness(options = {}) {
+  const h = harness({ idleCloseMs: 20, idleCloseBlocker: () => '', ...options })
+  const first = h.runtime.ensure()
+  h.frontends[0].resolveConnect()
+  await first
+  await until(() => h.runtime.parked)
+  return h
+}
+
+test('an idle session parks: the provider closes with no connection state, disconnect or reconnect', async () => {
+  const { runtime, calls, frontends } = await parkedHarness({ shouldReconnect: true })
+  assert.deepEqual(calls.filter(([name]) => name === 'close'), [['close', 'dashscope']])
+  assert.equal(runtime.ready, false)
+  assert.equal(runtime.frontend, null)
+  assert.deepEqual(connectionStates(calls), ['connecting', 'connected'])
+  assert.equal(calls.some(([name]) => name === 'onDisconnected'), false)
+  assert.equal(runtime.scheduledReconnect, null)
+  assert.ok(calls.some(([name, event]) => name === 'log.info' && event === 'realtime.parked'))
+
+  frontends[0].triggerClose()
+  frontends[0].triggerError(new Error('late failure'))
+  await wait(30)
+  assert.equal(frontends.length, 1, 'a late close from the parked socket does not reconnect')
+  assert.deepEqual(connectionStates(calls), ['connecting', 'connected'])
+  assert.equal(calls.some(([name]) => name === 'onDisconnected' || name === 'error'), false)
+  assert.equal(runtime.parked, true)
+  runtime.close()
+  assert.equal(runtime.parked, false, 'an explicit close ends the park')
+})
+
+test('an idle session stays open while anything holds it, and says why', async () => {
+  const reasons = calls => calls
+    .filter(([name, event]) => name === 'log.info' && event === 'realtime.idle_close_blocked')
+    .map(([, , fields]) => fields.reason)
+  const cases = [
+    { name: 'recent activity', options: { now: () => 0 }, hold: frontend => { frontend.lastActivityAt = 0 }, reason: null },
+    { name: 'busy frontend', hold: frontend => { frontend.quiescent = false }, reason: 'frontend_busy' },
+    { name: 'runtime blocker', options: { idleCloseBlocker: () => 'active_task' }, reason: 'active_task' },
+    { name: 'throwing blocker', options: { idleCloseBlocker: () => { throw new Error('boom') } }, reason: 'blocker_threw' },
+    { name: 'pending connect', hold: (_frontend, runtime) => { runtime.connectPromise = new Promise(() => {}) }, reason: null },
+    {
+      name: 'scheduled reconnect',
+      hold: (_frontend, runtime) => { runtime.scheduledReconnect = { promise: Promise.resolve(), resolve() {}, timer: null } },
+      reason: null,
+    },
+  ]
+  for (const { name, options = {}, hold = () => {}, reason } of cases) {
+    const { runtime, calls, frontends } = harness({
+      connectMode: 'resolve', idleCloseMs: 20, idleCloseBlocker: () => '', ...options,
+    })
+    await runtime.ensure()
+    hold(frontends[0], runtime)
+    await wait(100)
+    assert.equal(runtime.parked, false, name)
+    assert.equal(calls.some(([call]) => call === 'close'), false, name)
+    assert.deepEqual(reasons(calls), reason ? [reason] : [], name)
+    runtime.close()
+  }
+})
+
+test('a blocked idle close logs its reason once and parks once the session goes quiet', async () => {
+  let clock = 0
+  let blocker = 'active_task'
+  const { runtime, calls, frontends } = harness({
+    connectMode: 'resolve', idleCloseMs: 20, idleCloseBlocker: () => blocker, now: () => clock,
+  })
+  await runtime.ensure()
+  frontends[0].lastActivityAt = 0
+  await wait(60)
+  assert.equal(runtime.parked, false, 'quiet for less than the idle time')
+  clock = 100
+  await wait(1100)
+  assert.equal(runtime.parked, false)
+  assert.equal(calls.filter(([name, event]) => name === 'log.info' && event === 'realtime.idle_close_blocked').length, 1)
+  blocker = ''
+  await until(() => runtime.parked)
+  runtime.close()
+})
+
+test('a request after a park reopens the provider without connection state and reports the wake', async () => {
+  const { runtime, calls, frontends } = await parkedHarness()
+  const waking = runtime.ensure()
+  assert.equal(runtime.ensure(), waking, 'concurrent wakes share one attempt')
+  assert.equal(runtime.parked, true, 'parked until the new session is ready')
+  frontends[1].resolveConnect()
+  await waking
+  assert.equal(frontends.length, 2)
+  assert.equal(runtime.ready, true)
+  assert.equal(runtime.parked, false)
+  assert.deepEqual(connectionStates(calls), ['connecting', 'connected'])
+  assert.deepEqual(
+    calls.filter(([name]) => name === 'onReady').map(([, info]) => info),
+    [{ resumedFromPark: false }, { resumedFromPark: true }],
+  )
+  assert.equal(calls.filter(([name]) => name === 'onConnected').length, 2, 'ready hooks run again')
+  assert.ok(calls.some(([name, event, fields]) => (
+    name === 'log.info' && event === 'realtime.connected' && fields.resumedFromPark === true
+  )))
+  await until(() => runtime.parked)
+  assert.equal(frontends.length, 2, 'a woken session parks again when idle')
+  runtime.close()
+})
+
+test('a failed wake costs the request, not the link: no unavailable, no reconnect, still parked', async () => {
+  for (const order of ['reject then close', 'close then reject']) {
+    const { runtime, calls, frontends } = await parkedHarness({ shouldReconnect: true })
+    const waking = runtime.ensure()
+    const failure = new Error('connect failed')
+    if (order === 'close then reject') frontends[1].triggerClose()
+    frontends[1].rejectConnect(failure)
+    await assert.rejects(waking, error => error === failure, order)
+    if (order === 'reject then close') frontends[1].triggerClose()
+    await wait(20)
+    assert.deepEqual(connectionStates(calls), ['connecting', 'connected'], order)
+    assert.equal(runtime.parked, true, order)
+    assert.equal(runtime.scheduledReconnect, null, order)
+    assert.equal(frontends.length, 2, order)
+    assert.equal(calls.some(([name]) => name === 'onDisconnected' || name === 'error'), false, order)
+    assert.ok(calls.some(([name, event]) => name === 'log.warn' && event === 'realtime.unpark_failed'), order)
+    const retry = runtime.ensure()
+    frontends[2].resolveConnect()
+    await retry
+    assert.equal(runtime.ready, true, order)
+    runtime.close()
+  }
+})
+
+test('provider errors during a wake are left to the waking request; a fatal one ends the park as unavailable', async () => {
+  const { runtime, calls, frontends } = await parkedHarness()
+  const waking = runtime.ensure()
+  const failure = new Error('socket hang up')
+  frontends[1].triggerError(failure)
+  frontends[1].rejectConnect(failure)
+  await assert.rejects(waking, error => error === failure)
+  assert.equal(calls.some(([name]) => name === 'error'), false, 'the session does not report it')
+  assert.equal(failure.realtimeConnectionReported, undefined)
+
+  const blocked = runtime.ensure()
+  const fatal = new Error('invalid api key')
+  frontends[2].triggerError(fatal)
+  frontends[2].rejectConnect(fatal)
+  await assert.rejects(blocked, error => error === fatal)
+  assert.equal(runtime.parked, false, 'a fatal wake leaves the park')
+  assert.equal(fatal.realtimeConnectionReported, true, 'the unavailable state reports it, as without a park')
+  assert.equal(runtime.blockedError, 'invalid api key')
+  await assert.rejects(runtime.ensure(), /invalid api key/)
+  assert.deepEqual(connectionStates(calls), ['connecting', 'connected', 'unavailable'])
+  assert.deepEqual(calls.filter(([name]) => name === 'state').at(-1), [
+    'state', { state: 'unavailable', provider: 'dashscope', message: 'invalid api key' },
+  ])
+  assert.equal(calls.some(([name]) => name === 'error'), false)
+  runtime.close()
+})
+
+test('a fatal wake failure takes the path of a fatal connect without a park', async () => {
+  const trace = calls => calls.filter(([name]) => ['state', 'onDisconnected', 'error'].includes(name))
+  const plain = harness({ shouldReconnect: true })
+  const connecting = plain.runtime.ensure()
+  plain.frontends[0].rejectConnect(new Error('invalid api key'))
+  await assert.rejects(connecting, /invalid api key/)
+  plain.frontends[0].triggerClose()
+  const [first, ...expected] = trace(plain.calls)
+  assert.deepEqual(first, ['state', { state: 'connecting', provider: 'dashscope' }])
+  assert.ok(expected.length > 0)
+  plain.runtime.close()
+
+  const { runtime, calls, frontends } = await parkedHarness({ shouldReconnect: true })
+  const mark = calls.length
+  const waking = runtime.ensure()
+  frontends[1].rejectConnect(new Error('invalid api key'))
+  await assert.rejects(waking, /invalid api key/)
+  frontends[1].triggerClose()
+  await wait(20)
+  assert.deepEqual(trace(calls.slice(mark)), expected, 'the same unavailable, disconnect and block')
+  assert.equal(runtime.parked, false)
+  assert.equal(runtime.scheduledReconnect, null)
+  assert.equal(frontends.length, 2)
+  runtime.close()
+})
+
+test('an idle close longer than the timer range is not cut short', async () => {
+  const { runtime } = harness({ connectMode: 'resolve', idleCloseMs: 3_000_000_000, idleCloseBlocker: () => '' })
+  await runtime.ensure()
+  await wait(50)
+  assert.equal(runtime.parked, false)
+  runtime.close()
+})
+
+test('providers without idleCloseMs, or sessions without a blocker, never close on idle', async () => {
+  const plain = harness({ connectMode: 'resolve', idleCloseBlocker: () => '' })
+  await plain.runtime.ensure()
+  assert.equal(plain.runtime.idleTimer, null, 'no idle timer is armed')
+  const unwired = harness({ connectMode: 'resolve', idleCloseMs: 20 })
+  await unwired.runtime.ensure()
+  await wait(80)
+  for (const { runtime, calls } of [plain, unwired]) {
+    assert.equal(runtime.parked, false)
+    assert.equal(runtime.ready, true)
+    assert.equal(calls.some(([name]) => name === 'close'), false)
+    runtime.close()
+  }
 })

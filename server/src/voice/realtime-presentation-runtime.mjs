@@ -26,12 +26,18 @@ const PRESENTATION_RESPONSE_EVENTS = new Set([
   'response.done',
 ])
 
+// A concurrent voice layer speaks a finished backend step's result within this
+// long (the provider's result relay plus its owed window).
+const BACKEND_RESULT_OWED_MS = 6000
+
 export function confirmsTaskNotificationOnPlaybackStart(context) {
   return Boolean(
     context
     && (
       context.origin === 'announcement'
       || context.consumesTaskNotification
+      // A due reminder is delivered as a Gateway system event about its task.
+      || (context.origin === 'gateway-system-event' && (context.taskId || context.taskIds?.length))
     ),
   )
 }
@@ -77,6 +83,7 @@ export class RealtimePresentationRuntime {
     announcementQuietMs,
     responseContextCleanupMs,
     turnCitations = null,
+    backendResultOwedMs = BACKEND_RESULT_OWED_MS,
   }) {
     this.ownerId = ownerId
     this.sessionId = sessionId
@@ -94,8 +101,11 @@ export class RealtimePresentationRuntime {
     this.announcementQuietMs = announcementQuietMs
     this.responseContextCleanupMs = responseContextCleanupMs
     this.turnCitations = turnCitations
+    this.backendResultOwedMs = backendResultOwedMs
     this.contexts = new Map()
     this.playbackTurns = new Map()
+    // Finished backend steps whose result the voice layer has not spoken yet.
+    this.owedResults = new Map()
     this.lastCorrectionTurn = null
   }
 
@@ -150,24 +160,25 @@ export class RealtimePresentationRuntime {
     const id = realtimeResponseId(event)
     if (!id) return null
     const existing = this.contexts.get(id)
+    const source = existing ? event : this.#adoptBackendIdentity(id, event)
     const automaticResponse = (
       !existing
-      && (event.__voiceOrigin || 'model') === 'model'
-      && !event.__voiceContext?.turnId
+      && (source.__voiceOrigin || 'model') === 'model'
+      && !source.__voiceContext?.turnId
     )
     const automaticTurn = automaticResponse
       ? this.getResponseTurnCandidate()
       : null
     const fallback = {
-      turnId: event.__voiceContext?.turnId
+      turnId: source.__voiceContext?.turnId
         || automaticTurn?.turnId
         || this.turns.committedTurnId
         || this.turns.turnId,
-      taskId: event.__voiceContext?.taskId || null,
-      origin: event.__voiceOrigin || 'model',
-      authorizationId: event.__voiceContext?.authorizationId || null,
-      turnGeneration: Number.isInteger(event.__voiceContext?.turnGeneration)
-        ? event.__voiceContext.turnGeneration
+      taskId: source.__voiceContext?.taskId || null,
+      origin: source.__voiceOrigin || 'model',
+      authorizationId: source.__voiceContext?.authorizationId || null,
+      turnGeneration: Number.isInteger(source.__voiceContext?.turnGeneration)
+        ? source.__voiceContext.turnGeneration
         : automaticTurn?.turnGeneration
           ?? (this.turns.committedTurnId
             ? this.turns.committedTurnGeneration
@@ -176,7 +187,7 @@ export class RealtimePresentationRuntime {
     const context = mergeResponseContext(
       this.contexts,
       id,
-      responseActivityContextPatch({ existing, event, fallback }),
+      responseActivityContextPatch({ existing, event: source, fallback }),
     )
     if (
       this.turns.manualInputGeneration !== null
@@ -196,7 +207,15 @@ export class RealtimePresentationRuntime {
       this.turns.commit(automaticTurn)
       this.clearResponseCandidate()
     }
-    if (!context.responseStarted && !context.suppressed) {
+    // With a concurrent voice layer the backend response has no audio of its
+    // own; the voice layer speaks. Clients see only the spoken response, so a
+    // backend step finishing does not end a turn whose answer is still owed.
+    if (!existing) {
+      context.backendOnly = this.getFrontend?.()?.capabilities?.concurrentVoicePlayback === true
+        && event.__voicePlayback !== true
+      if (context.backendOnly) context.turnSequence = this.turns.turnSequence
+    }
+    if (!context.responseStarted && !context.suppressed && !context.backendOnly) {
       context.responseStarted = true
       this.send({
         type: GatewayServerEvent.RESPONSE_STARTED,
@@ -205,6 +224,63 @@ export class RealtimePresentationRuntime {
       })
     }
     return context
+  }
+
+  // The voice layer speaks for a backend step that carries a Gateway request
+  // (announcement, permission, ...); its speech takes that identity so the
+  // client's playback receipt confirms the request.
+  #adoptBackendIdentity(id, event) {
+    if (
+      event.__voicePlayback !== true
+      || this.getFrontend?.()?.capabilities?.concurrentVoicePlayback !== true
+    ) return event
+    const backend = [...this.owedResults.keys(), ...this.contexts.values()]
+      .find(context => this.#speaksFor(context))
+    if (!backend) return event
+    backend.adoptedBy = id
+    this.#releaseOwed(backend)
+    const { turnId, taskId, taskIds, authorizationId, turnGeneration } = backend
+    return {
+      ...event,
+      __voiceOrigin: backend.origin,
+      __voiceContext: { ...event.__voiceContext, turnId, taskId, taskIds, authorizationId, turnGeneration },
+    }
+  }
+
+  // A request from before the latest user turn is no longer what the voice speaks.
+  #speaksFor(context) {
+    return Boolean(
+      context.backendOnly
+      && !context.adoptedBy
+      && !context.suppressed
+      && context.origin !== 'model'
+      && context.turnSequence === this.turns.turnSequence,
+    )
+  }
+
+  // Held like unplayed audio so no other delivery starts before the voice
+  // speaks it; unspoken within the window, the result is delivered again.
+  #oweResult(id, context) {
+    this.announcementWindow.queueAudio(id, { turnId: context.turnId, origin: context.origin })
+    const timer = setTimeout(() => {
+      if (!this.#releaseOwed(context)) return
+      if (context.origin === 'announcement') {
+        this.announcements.retryMany(contextTaskIds(context))
+      } else {
+        this.#flushAnnouncementsSoon()
+      }
+    }, this.backendResultOwedMs)
+    timer.unref?.()
+    this.owedResults.set(context, { id, timer })
+  }
+
+  #releaseOwed(context) {
+    const owed = this.owedResults.get(context)
+    if (!owed) return false
+    clearTimeout(owed.timer)
+    this.owedResults.delete(context)
+    this.announcementWindow.finishPlayback(owed.id)
+    return true
   }
 
   handle(event) {
@@ -248,6 +324,14 @@ export class RealtimePresentationRuntime {
     const context = this.#contextFor(event)
     if (context?.suppressed) return
     const responseTurnId = context.turnId || this.turns.turnId
+    if (context.backendOnly) {
+      // Audio after all: present it as a normal response from here on.
+      context.backendOnly = false
+      if (!context.responseStarted) {
+        context.responseStarted = true
+        this.send({ type: GatewayServerEvent.RESPONSE_STARTED, responseId: id, ...this.publicContext(context) })
+      }
+    }
     if (id) {
       context.hasAudio = true
       this.playbackTurns.set(id, responseTurnId)
@@ -367,12 +451,17 @@ export class RealtimePresentationRuntime {
       suppressed: Boolean(context?.suppressed),
       transcript: context?.assistantTranscript || '',
     })
-    if (!context?.suppressed) {
-      this.send({
-        type: GatewayServerEvent.AUDIO_DONE,
-        responseId: id,
-        turnId: responseTurnId,
-      })
+    if (context?.backendOnly && this.getFrontend?.()?.playbackResponses?.size) {
+      // Internal only while the voice layer speaks; its response reports the turn's end.
+    } else if (!context?.suppressed) {
+      // A backend step has no audio of its own; with nothing spoken only idle applies.
+      if (!context?.backendOnly) {
+        this.send({
+          type: GatewayServerEvent.AUDIO_DONE,
+          responseId: id,
+          turnId: responseTurnId,
+        })
+      }
       if (!context?.hasAudio && !toolFollowUpPending) {
         this.send({
           type: GatewayServerEvent.VOICE_STATE,
@@ -409,9 +498,13 @@ export class RealtimePresentationRuntime {
       ) {
         this.#flushPendingTranscripts(id, context)
       }
+      const owesSpeech = Boolean(context && !failed && this.#speaksFor(context))
+      if (owesSpeech) this.#oweResult(id, context)
       if (context?.origin === 'announcement') {
         if (completedNonVoiceAnnouncement) {
           this.announcements.confirmMany(contextTaskIds(context))
+        } else if (context.adoptedBy || owesSpeech) {
+          // The voice response speaking this result confirms or retries it.
         } else {
           this.announcements.retryMany(contextTaskIds(context))
         }
@@ -688,5 +781,7 @@ export class RealtimePresentationRuntime {
   clear() {
     this.contexts.clear()
     this.playbackTurns.clear()
+    for (const { timer } of this.owedResults.values()) clearTimeout(timer)
+    this.owedResults.clear()
   }
 }

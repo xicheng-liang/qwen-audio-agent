@@ -11,15 +11,26 @@ export class RealtimeAgentDeliveryRuntime {
   constructor({
     getFrontend,
     isDeliveryBlocked = () => false,
+    // Returns a promise when the frontend has to be reopened first, else null.
+    wakeFrontend = null,
   } = {}) {
     this.getFrontend = getFrontend
     this.isDeliveryBlocked = isDeliveryBlocked
+    this.wakeFrontend = wakeFrontend
   }
 
   async deliver(value, { shouldDeliver, injectContext = true } = {}) {
     const delivery = createAgentDelivery(value)
     if (delivery.mode === AgentDeliveryMode.HANDLE) {
       return { completed: true, handled: true, mode: delivery.mode }
+    }
+    const waking = this.wakeFrontend?.(delivery)
+    if (waking) {
+      try {
+        await waking
+      } catch {
+        return { completed: false, unavailable: true, mode: delivery.mode }
+      }
     }
     if (this.isDeliveryBlocked(delivery)) {
       return { completed: false, blocked: true, mode: delivery.mode }

@@ -121,9 +121,18 @@ export function createRealtimeSessionRuntime({
   const turnCitations = new TurnCitations()
   let realtimeSession
   let visualInput
+  // The text turn whose request wakes a parked session: it is sent as the
+  // request itself, so it must not also be seeded as history.
+  let wakeSeedTurnId = ''
   const clearVisualInput = () => {
     realtimeSession?.clearPendingImage?.()
     visualInput?.reset?.()
+  }
+  // Reopens a parked provider session; null when there is nothing to wake.
+  const wakeProvider = reason => {
+    if (closed || !realtimeSession?.parked || !outputEnabled) return null
+    connectionLogger.info('realtime.unpark', { reason })
+    return realtimeSession.ensure()
   }
   const agentDeliveries = new RealtimeAgentDeliveryRuntime({
     getFrontend: () => realtimeSession?.frontend,
@@ -132,6 +141,7 @@ export function createRealtimeSessionRuntime({
       || !realtimeSession?.ready
       || (delivery.mode !== 'context' && (sleeping || waking || !outputEnabled))
     ),
+    wakeFrontend: () => wakeProvider('delivery'),
   })
   const observeSessionAudio = event => observers.emit('onAudio', {
     ownerId, sessionId, event, logger: connectionLogger,
@@ -160,7 +170,9 @@ export function createRealtimeSessionRuntime({
       tools: frontendSourceToolDefinitions(sessionToolSources),
     },
     memories: memoryService?.list(ownerId, { limit: 64 }) || [],
-    recentMessages: frontendRecentMessages(),
+    recentMessages: wakeSeedTurnId
+      ? frontendRecentMessages().filter(message => message.turnId !== wakeSeedTurnId)
+      : frontendRecentMessages(),
     ...(sessionAssistantProfile
       ? { assistantProfile: sessionAssistantProfile }
       : {}),
@@ -173,6 +185,7 @@ export function createRealtimeSessionRuntime({
     presentation: createRealtimeTaskPresentation({
       getState: () => ({
         ready: realtimeSession?.ready === true,
+        parked: realtimeSession?.parked === true,
         outputEnabled, sleeping, waking,
         windowBlocked: announcementWindow.isBlocked(),
         busy: turns.userSpeaking || announcementWindow.isBlocked(),
@@ -191,6 +204,11 @@ export function createRealtimeSessionRuntime({
     onTaskEvent,
     onResult: task => recordTaskResult({ conversationSync, ownerId, sessionId, task }),
     onWake: () => wakeFromSleep(),
+    // Rejects on failure so the coordinator can retry the wake.
+    onUnpark: reason => wakeProvider(reason)?.catch(error => {
+      connectionLogger.warn('realtime.unpark_failed', { reason, error: error.message })
+      throw error
+    }),
   })
   const { results: announcements, progress: progressAnnouncements } = taskCoordinator.announcements
   const reportFrontendError = error => {
@@ -225,16 +243,19 @@ export function createRealtimeSessionRuntime({
       taskCoordinator.announcePendingPermissions()
       taskCoordinator.announcePendingInputs()
     },
-    onReady: createdFrontend => {
+    onReady: (createdFrontend, { resumedFromPark = false } = {}) => {
       const resumedFromSleep = waking
       waking = false
       if (outputEnabled) taskCoordinator.claimPendingNotifications()
-      emit({
-        type: GatewayServerEvent.VOICE_READY,
-        inputSampleRate: createdFrontend.provider.inputSampleRate,
-        provider: createdFrontend.provider.key,
-        providerLabel: createdFrontend.provider.label,
-      })
+      // A wake is invisible to the client: it already saw voice.ready.
+      if (!resumedFromPark) {
+        emit({
+          type: GatewayServerEvent.VOICE_READY,
+          inputSampleRate: createdFrontend.provider.inputSampleRate,
+          provider: createdFrontend.provider.key,
+          providerLabel: createdFrontend.provider.label,
+        })
+      }
       sleepController.recordActivity()
       progressAnnouncements.flush()
       if (resumedFromSleep) {
@@ -274,6 +295,19 @@ export function createRealtimeSessionRuntime({
     logger: connectionLogger,
     maxPendingAudioChunks: MAX_PENDING_AUDIO_CHUNKS,
     stableConnectionMs: REALTIME_STABLE_CONNECTION_MS,
+    // Why an idle provider session must stay open, or '' when it may park.
+    // No park while this session has an active task, so progress and
+    // permission prompts behave as without parking.
+    idleCloseBlocker: () => (
+      closed ? 'closed'
+        : !outputEnabled || !voiceAccess.isActive() ? 'no_output'
+          : sleeping || waking ? 'sleep'
+            : turns.userSpeaking || announcementWindow.isBlocked() ? 'turn_or_playback'
+              : responseTurnCandidate || permissionResponseTimer ? 'response_candidate'
+                : toolCallTimings.size ? 'tool_call'
+                  : taskCoordinator.activeTasks().length ? 'active_task'
+                    : announcements.isIdle?.() !== true ? 'announcement' : ''
+    ),
     ...(realtimeFrontendFactory
       ? { createFrontend: realtimeFrontendFactory }
       : {}),
@@ -515,7 +549,30 @@ export function createRealtimeSessionRuntime({
     announcements,
     send: event => emit(event),
     getFrontend: () => realtimeSession.frontend,
-    ensureFrontend: () => realtimeSession.ensure(),
+    // The waking turn stays out of every context read until the connect settles;
+    // a context refresh during the connect would otherwise seed it back.
+    ensureFrontend: ({ turnId } = {}) => {
+      if (!realtimeSession.parked || !turnId) return realtimeSession.ensure()
+      wakeSeedTurnId = turnId
+      const clear = () => { if (wakeSeedTurnId === turnId) wakeSeedTurnId = '' }
+      let waking
+      try {
+        waking = realtimeSession.ensure()
+      } catch (error) {
+        clear()
+        throw error
+      }
+      waking.then(clear, () => {
+        clear()
+        // The failed wake ends this turn with no response: release it as a failed
+        // response does, so held requests and results are not blocked behind it.
+        announcementWindow.responseDone({ turnId, failed: true })
+        taskCoordinator.announcePendingPermissions()
+        taskCoordinator.announcePendingInputs()
+        announcements.flush()
+      })
+      return waking
+    },
     clearResponseCandidate,
     expectResponseFor,
     shouldEnsurePermissionResponse: context => responseTurnCandidate === context,

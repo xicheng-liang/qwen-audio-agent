@@ -120,6 +120,12 @@ export class AnnouncementManager {
     return this.pending.has(taskId)
   }
 
+  // Nothing queued, being spoken, awaiting a receipt or scheduled for retry.
+  isIdle() {
+    return !this.closed && !this.pending.size && !this.activeBatch
+      && !this.delivering && !this.deliveryTimer && !this.retryTimer
+  }
+
   queue(taskId, announcement) {
     this.pending.set(taskId, {
       ...announcement,

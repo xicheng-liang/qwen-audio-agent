@@ -1,6 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import { TaskDomainEvent } from '../task/task-events.mjs'
 
+// A failed wake of a parked session is retried after these delays, then left
+// for the next request.
+const WAKE_RETRY_DELAYS_MS = [2000, 4000, 8000]
+
 /**
  * Per-frontend-session Task observation and delivery policy. TaskManager remains
  * the state/notification authority; closing this observer never cancels work.
@@ -13,6 +17,7 @@ export class SessionTaskCoordinator {
   constructor({
     taskManager, ownerId, sessionId, presentation,
     onTaskEvent = () => {}, onResult = () => {}, onWake = () => {},
+    onUnpark = () => {},
     retryMs = 100,
   }) {
     this.taskManager = taskManager
@@ -22,11 +27,14 @@ export class SessionTaskCoordinator {
     this.onTaskEvent = onTaskEvent
     this.onResult = onResult
     this.onWake = onWake
+    this.onUnpark = onUnpark
     this.retryMs = Math.max(100, retryMs)
     this.claimantId = `session_${randomUUID()}`
     this.requests = { permission: new Map(), input: new Map() }
     this.closed = false
     this.retryTimer = null
+    this.wakeRetryTimer = null
+    this.wakeRetries = 0
     this.unsubscribe = null
     this.announcements = presentation.createAnnouncements({
       isTaskActive: id => this.activeTasks().some(task => task.id === id
@@ -80,6 +88,49 @@ export class SessionTaskCoordinator {
       && !state.sleeping && !state.waking
   }
 
+  // Undeliverable only because the idle provider session was closed: reopen it;
+  // its ready hooks then announce and claim what is pending. While a retry is
+  // scheduled, that retry covers new work too.
+  #wakeIfParked(reason) {
+    if (this.closed || this.wakeRetryTimer || !this.presentation.state().parked) return
+    Promise.resolve(this.onUnpark(reason)).then(
+      () => { this.wakeRetries = 0 },
+      () => this.#scheduleWakeRetry(),
+    )
+  }
+
+  // Silent bounded backoff; it ends once the session is no longer parked or
+  // nothing waits for it.
+  #scheduleWakeRetry() {
+    if (this.closed || this.wakeRetryTimer) return
+    if (!this.presentation.state().parked || this.wakeRetries >= WAKE_RETRY_DELAYS_MS.length) {
+      this.wakeRetries = 0
+      return
+    }
+    this.wakeRetryTimer = setTimeout(() => {
+      this.wakeRetryTimer = null
+      if (!this.closed && this.presentation.state().parked && this.#hasUndelivered()) {
+        this.#wakeIfParked('retry')
+      } else {
+        this.wakeRetries = 0
+      }
+    }, WAKE_RETRY_DELAYS_MS[this.wakeRetries++])
+    this.wakeRetryTimer.unref?.()
+  }
+
+  #clearWakeRetry() {
+    clearTimeout(this.wakeRetryTimer)
+    this.wakeRetryTimer = null
+    this.wakeRetries = 0
+  }
+
+  // Open requests or unclaimed results of this session that a wake would deliver.
+  #hasUndelivered() {
+    return this.hasPendingPermission() || this.hasPendingInput()
+      || this.taskManager.list({ ownerId: this.ownerId, sessionId: this.sessionId })
+        .some(task => task.notificationStatus === 'pending')
+  }
+
   scheduleRetry() {
     if (this.retryTimer || !this.canDeliver()) return
     this.retryTimer = setTimeout(() => {
@@ -93,7 +144,11 @@ export class SessionTaskCoordinator {
   announceRequest(task, kind) {
     const request = this.requestFor(task, kind)
     const announced = this.requests[kind]
-    if (!this.canDeliver() || request?.status !== 'pending' || announced.has(request.id)) return
+    if (request?.status !== 'pending' || announced.has(request.id)) return
+    if (!this.canDeliver()) {
+      this.#wakeIfParked(kind)
+      return
+    }
     if (this.presentation.state().busy) {
       this.scheduleRetry()
       return
@@ -137,6 +192,7 @@ export class SessionTaskCoordinator {
     // frontend connection. Invalidate old attempts before reconnecting.
     if (this.retryTimer) clearTimeout(this.retryTimer)
     this.retryTimer = null
+    this.#clearWakeRetry()
     this.requests.permission.clear()
     this.requests.input.clear()
   }
@@ -147,7 +203,10 @@ export class SessionTaskCoordinator {
   }
 
   claimPendingNotifications(taskIds, { includeOtherSessions = !taskIds?.length } = {}) {
-    if (!this.canDeliver()) return
+    if (!this.canDeliver()) {
+      this.#wakeIfParked('notification')
+      return
+    }
     const claimed = this.taskManager.claimNotifications({
       ownerId: this.ownerId,
       sessionId: this.sessionId,
