@@ -9,7 +9,7 @@
 #   GET /t/<tenant>/api/realtime · POST /t/<tenant>/warm · POST /t/<tenant>/drop
 # Secrets are copied server-side into 600 files and never printed. down removes every container,
 # those copies and the tenants' data; the scripts and the qaa:gpt-live-1-exp image stay.
-# Test knobs for up: GLX_MAX (5), GLX_IDLE_S (1800), GLX_SWEEP_S (60).
+# Test knobs for up: GLX_MAX (30), GLX_IDLE_S (1800), GLX_SWEEP_S (60).
 set -euo pipefail
 cd "$(dirname "$0")"
 HERE=$PWD
@@ -65,7 +65,7 @@ cmd_up() {
   sudo docker rm -f "$ENTRY" "$DOORMAN" >/dev/null 2>&1 || true
   sudo docker run -d --name "$DOORMAN" --restart unless-stopped --network host \
     -v /var/run/docker.sock:/var/run/docker.sock -v "$HERE:/glx" \
-    -e GLX_HOST_ROOT="$HERE" -e GLX_IMAGE="$IMAGE" -e GLX_MAX="${GLX_MAX:-5}" \
+    -e GLX_HOST_ROOT="$HERE" -e GLX_IMAGE="$IMAGE" -e GLX_MAX="${GLX_MAX:-30}" -e GLX_PORTS=3130-3159 \
     -e GLX_IDLE_S="${GLX_IDLE_S:-1800}" -e GLX_SWEEP_S="${GLX_SWEEP_S:-60}" \
     --label trial.owner=xicheng --label trial.purpose=glx "$PY" python -u /glx/doorman.py >/dev/null
   local _
@@ -86,7 +86,7 @@ cmd_up() {
   restarts=$(sudo docker inspect -f '{{.RestartCount}}' "$ENTRY")
   [ "$code" = 404 ] && [ "$restarts" = 0 ] \
     || { echo "entry not serving (http $code, restarts $restarts)"; sudo docker logs --tail 10 "$ENTRY"; exit 1; }
-  echo "glx up: entry 10.0.2.151:80, doorman 127.0.0.1:4299, max ${GLX_MAX:-5}, idle ${GLX_IDLE_S:-1800}s"
+  echo "glx up: entry 10.0.2.151:80, doorman 127.0.0.1:4299, max ${GLX_MAX:-30}, idle ${GLX_IDLE_S:-1800}s"
 }
 
 cmd_down() {
