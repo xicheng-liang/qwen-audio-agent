@@ -190,6 +190,19 @@ function dropSpontaneousSpeech() {
   return String(process.env.GPT_LIVE_1_DROP_SPONTANEOUS_SPEECH || '').trim() === '1'
 }
 
+// Drop the rest of an answer a Gateway cancel cut (off by default): a text-only
+// client cannot barge in, so the voice layer would finish it in the next answer.
+function dropCancelledTail() {
+  return String(process.env.GPT_LIVE_1_DROP_CANCELLED_TAIL || '').trim() === '1'
+}
+
+// Fixed gain on the voice output, 0.25 to 4 (default 1). Measured on the earbud:
+// about 6 dB below the other providers, with about 10 dB of peak headroom.
+function outputGain() {
+  const value = Number(process.env.GPT_LIVE_1_OUTPUT_GAIN)
+  return Number.isFinite(value) && value > 0 ? Math.min(4, Math.max(0.25, value)) : 1
+}
+
 function idleCloseMs() {
   const value = Number(process.env.GPT_LIVE_1_IDLE_CLOSE_MS)
   return Number.isFinite(value) && value > 0 ? Math.max(MIN_IDLE_CLOSE_MS, Math.floor(value)) : 0
@@ -246,6 +259,8 @@ export const gptLive1Provider = {
     ...context,
     outputIdleMs: outputIdleMs(),
     dropSpontaneousSpeech: dropSpontaneousSpeech(),
+    dropCancelledTail: dropCancelledTail(),
+    outputGain: outputGain(),
     itemMaxBytes: backendItemMaxBytes(),
     standingInstructions: STANDING_RESPONSE_INSTRUCTIONS,
     onStartupError: (error, { session } = {}) => {

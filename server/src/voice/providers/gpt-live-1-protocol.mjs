@@ -69,6 +69,12 @@ export const DEFAULT_RESULT_RELAY_MS = 2000
 // pending would reach it as a stray notification, so it is dropped.
 const SPONTANEOUS_INPUT_QUIET_MS = 10000
 const RESULT_RELAY_QUIET_MS = 700
+// With dropCancelledTail, a Gateway cancel drops the rest of the cut answer: a
+// text-only client cannot barge in on the service, so the voice keeps talking.
+// The drop ends once the voice pauses, or this long after the next request so
+// the new answer is never swallowed.
+const CANCEL_TAIL_QUIET_MS = 700
+const CANCEL_TAIL_MAX_AFTER_REQUEST_MS = 2500
 const BACKEND_TEXT_MAX_CHARS = 4000
 // While the timeline runs the service streams output audio continuously,
 // silence included, so missing deltas never mark the end of speech. A frame
@@ -88,6 +94,17 @@ function silentPcm16(base64) {
     sum += value * value
   }
   return Math.sqrt(sum / samples) < OUTPUT_SILENCE_RMS
+}
+
+// Fixed output gain with hard clipping; a no-op at 1.
+function scalePcm16(base64, gain) {
+  if (gain === 1 || !base64) return base64
+  const pcm = Buffer.from(String(base64), 'base64')
+  for (let offset = 0; offset + 1 < pcm.length; offset += 2) {
+    const value = Math.round(pcm.readInt16LE(offset) * gain)
+    pcm.writeInt16LE(Math.max(-32768, Math.min(32767, value)), offset)
+  }
+  return pcm.toString('base64')
 }
 // The three append events accept at most 500 tokens. Estimate tokens
 // conservatively (a CJK character is about one token, other text about four
@@ -356,9 +373,15 @@ export function createGptLive1Protocol({
   voiceOwedMs = DEFAULT_VOICE_OWED_MS,
   resultRelayMs = DEFAULT_RESULT_RELAY_MS,
   dropSpontaneousSpeech = false,
+  dropCancelledTail = false,
+  outputGain = 1,
   now = () => performance.now(),
 } = {}) {
   let voiceResponseId = ''
+  // Set by a Gateway cancel with dropCancelledTail; see CANCEL_TAIL_QUIET_MS.
+  let cancelTail = false
+  let cancelTailVoicedAt = 0
+  let cancelTailRequestAt = 0
   // Output transcript of the open spoken segment. The runtime records the
   // assistant turn from transcript.done; without it history holds only the
   // user's side and a new session answers old questions again.
@@ -707,6 +730,20 @@ export function createGptLive1Protocol({
     return false
   }
 
+  // Output still belonging to an answer a Gateway cancel cut; a spoken frame
+  // keeps the drop going.
+  const cancelledTail = voiced => {
+    if (!cancelTail) return false
+    const at = now()
+    if (at - cancelTailVoicedAt >= CANCEL_TAIL_QUIET_MS
+      || (cancelTailRequestAt && at - cancelTailRequestAt >= CANCEL_TAIL_MAX_AFTER_REQUEST_MS)) {
+      cancelTail = false
+      return false
+    }
+    if (voiced) cancelTailVoicedAt = at
+    return true
+  }
+
   // Ends the user's turn in the runtime's model (GA order: speech_stopped,
   // committed, then the response). The transcript keeps streaming into the
   // committed item until it completes, exactly as GA transcription arrives late.
@@ -860,8 +897,13 @@ export function createGptLive1Protocol({
         const silent = silentPcm16(event.delta)
         if (!silent) lastVoicedAt = now()
         noteOutputFrame(silent, pcm16Ms(event.delta))
+        if (cancelledTail(!silent)) {
+          heldSilentDelta = ''
+          return events
+        }
+        const delta = scalePcm16(event.delta || '', outputGain)
         if (silent && !voiceResponseId) {
-          heldSilentDelta = event.delta || ''
+          heldSilentDelta = delta
           return events
         }
         if (spontaneous()) {
@@ -890,7 +932,7 @@ export function createGptLive1Protocol({
         events.push({
           type: 'response.output_audio.delta',
           response_id: responseId,
-          delta: event.delta || '',
+          delta,
         })
         // A pause inside speech is played but does not extend the segment, so
         // it closes one idle window after the last spoken frame.
@@ -917,6 +959,7 @@ export function createGptLive1Protocol({
       case 'session.output_transcript.delta': {
         const events = []
         if (interruptedTail(Number(event.start_ms), Number(event.end_ms))) return events
+        if (cancelledTail(false)) return events
         if (spontaneous()) return events
         commitInput(events)
         const responseId = openVoiceResponse(events, Number(event.start_ms))
@@ -1095,6 +1138,10 @@ export function createGptLive1Protocol({
       if (payload == null) return null
       const encoded = { event_id: eventId(), ...payload }
       if (payload.type === 'response.create') awaitingBackend = true
+      if (cancelTail && !cancelTailRequestAt
+        && (payload.type === 'response.create' || payload.type === 'session.commentary.append')) {
+        cancelTailRequestAt = now()
+      }
       if (payload.type === 'response.item.create' && payload.item?.type === 'function_call_output') {
         pendingFunctionCalls.delete(payload.item.call_id)
       }
@@ -1231,6 +1278,11 @@ export function createGptLive1Protocol({
     // frees them; backend responses keep running as they do on the service.
     // The close is delivered asynchronously like a wire event.
     responseCancel: () => {
+      if (dropCancelledTail && voiceResponseId) {
+        cancelTail = true
+        cancelTailVoicedAt = now()
+        cancelTailRequestAt = 0
+      }
       clearOutputIdle()
       // What was heard of the cut segment is recorded once, as on a barge-in,
       // and none of it is carried into the next answer.

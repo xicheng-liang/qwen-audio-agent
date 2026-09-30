@@ -1878,3 +1878,80 @@ test('GPT-Live 1 still speaks for a pending request, a speaking microphone, and 
   speak.advance(1000)
   assert.equal(speak.voiced()[0].type, 'response.created', 'the acknowledged announcement is spoken after its ack')
 })
+
+test('GPT-Live 1 applies the output gain after judging silence, clipping at full scale', () => {
+  const protocol = createGptLive1Protocol({ emit: () => {}, inputKeepaliveMs: 0, outputIdleMs: 0, outputGain: 2 })
+  protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  const scaled = base64 => {
+    const pcm = Buffer.from(base64, 'base64')
+    for (let offset = 0; offset < pcm.length; offset += 2) {
+      pcm.writeInt16LE(Math.max(-32768, Math.min(32767, pcm.readInt16LE(offset) * 2)), offset)
+    }
+    return pcm.toString('base64')
+  }
+  const onset = pcmFrame({ amplitude: 150 })
+  assert.deepEqual(protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: onset }), [],
+    'a frame that is silent before the gain stays silence')
+  const loud = pcmFrame({ amplitude: 20000 })
+  const events = protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: loud })
+  assert.deepEqual(events.map(event => event.type), ['response.created', 'response.output_audio.delta', 'response.output_audio.delta'])
+  assert.equal(events[1].delta, scaled(onset), 'the held onset plays with the same gain')
+  assert.equal(events[2].delta, scaled(loud), 'speech is doubled and clipped at full scale')
+  assert.ok(Buffer.from(events[2].delta, 'base64').includes(Buffer.from([0xff, 0x7f])), 'peaks are clipped, not wrapped')
+})
+
+function cancelHarness(t, options = {}) {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  let clock = 20000
+  const protocol = createGptLive1Protocol({
+    emit: () => {}, inputKeepaliveMs: 0, outputIdleMs: 800, dropCancelledTail: true, now: () => clock, ...options,
+  })
+  protocol.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+  const voiced = () => protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: pcmFrame({ amplitude: 3000 }) })
+  const silence = () => protocol.normalizeIncoming({ type: 'session.output_audio.delta', delta: pcmFrame() })
+  const words = () => protocol.normalizeIncoming({ type: 'session.output_transcript.delta', delta: '的小助手' })
+  const advance = ms => { clock += ms; t.mock.timers.tick(ms) }
+  return { protocol, voiced, silence, words, advance }
+}
+
+test('GPT-Live 1 drops the rest of an answer a Gateway cancel cut until the voice pauses', t => {
+  const h = cancelHarness(t)
+  const cut = h.voiced()[0].response_id
+  h.advance(100)
+  h.protocol.responseCancel()
+  for (let i = 0; i < 5; i += 1) {
+    h.advance(100)
+    assert.deepEqual(h.voiced(), [], 'the cut answer keeps streaming but is not played')
+  }
+  assert.deepEqual(h.words(), [], 'nor recorded as the start of the next answer')
+  for (let i = 0; i < 7; i += 1) {
+    h.advance(100)
+    assert.deepEqual(h.silence(), [])
+  }
+  const next = h.voiced()
+  assert.equal(next[0].type, 'response.created', 'speech after the pause is a new answer')
+  assert.notEqual(next[0].response_id, cut)
+})
+
+test('GPT-Live 1 stops dropping a cut answer 2.5 s after the next request, so the new answer is heard', t => {
+  const h = cancelHarness(t)
+  h.voiced()
+  h.protocol.responseCancel()
+  h.advance(100)
+  assert.deepEqual(h.voiced(), [])
+  h.protocol.encodeOutgoing({ type: 'response.create' })
+  for (let i = 0; i < 24; i += 1) {
+    h.advance(100)
+    assert.deepEqual(h.voiced(), [], 'the voice is still finishing the cut answer')
+  }
+  h.advance(100)
+  assert.equal(h.voiced()[0].type, 'response.created')
+})
+
+test('GPT-Live 1 keeps speech after a Gateway cancel unless dropCancelledTail is on', t => {
+  const h = cancelHarness(t, { dropCancelledTail: false })
+  h.voiced()
+  h.protocol.responseCancel()
+  h.advance(100)
+  assert.equal(h.voiced()[0].type, 'response.created')
+})

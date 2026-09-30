@@ -31,6 +31,8 @@ OPENAI_API_KEY=your-openai-key
 | `GPT_LIVE_1_TOOL_OUTPUT_MAX_BYTES` | Empty | Hard cap on one backend input item (a tool result, typed text). By default an item may use half of what is left of the session's backend input budget |
 | `GPT_LIVE_1_IDLE_CLOSE_MS` | `0` (off) | Closes the Live session after this long with nothing in flight and reopens it on the next request, because the service bills for the time a session is open. Values below `10000` are raised to `10000` |
 | `GPT_LIVE_1_DROP_SPONTANEOUS_SPEECH` | off | Set to `1` to drop speech the voice layer starts on its own while a text-only client (no input audio for 10 s) has nothing pending, such as a stray backchannel after an answer |
+| `GPT_LIVE_1_DROP_CANCELLED_TAIL` | off | Set to `1` to drop the rest of an answer a Gateway cancel cut, until the voice pauses for 700 ms or 2.5 s after the next request. A text-only client cannot barge in on the service, so the voice would otherwise finish the cut answer at the start of the next one |
+| `GPT_LIVE_1_OUTPUT_GAIN` | `1` | Fixed gain on the voice output, `0.25` to `4`, clipped at full scale. Silence is judged before the gain |
 
 Desktop exposes the endpoint, key, model, and voice fields under
 **Voice frontend → GPT-Live 1**. Restart a terminal Gateway after editing the
