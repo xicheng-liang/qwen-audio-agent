@@ -5,6 +5,7 @@ import { config } from '../src/core/config.mjs'
 import { RealtimeFrontend } from '../src/voice/realtime-provider.mjs'
 import { RealtimeProviderSession } from '../src/voice/realtime-provider-session.mjs'
 import { gptLive1Provider, sessionInputHistory } from '../src/voice/providers/gpt-live-1.mjs'
+import { GatewaySystemEvent, createGatewaySystemEventDelivery } from '../src/delivery/gateway-system-event.mjs'
 import { ToolCallHandler } from '../src/frontend/tools/tool-call-handler.mjs'
 import {
   permissionResponseInstructions,
@@ -1954,4 +1955,14 @@ test('GPT-Live 1 keeps speech after a Gateway cancel unless dropCancelledTail is
   h.protocol.responseCancel()
   h.advance(100)
   assert.equal(h.voiced()[0].type, 'response.created')
+})
+
+test('GPT-Live 1 asks the backend for the sentence to say when a reminder is due', () => {
+  const protocol = createGptLive1Protocol()
+  const due = createGatewaySystemEventDelivery(GatewaySystemEvent.REMINDER_DUE, { data: { content: '提醒你喝水' } })
+  const [part] = protocol.conversationItemCreate(gptLive1Provider.buildResultInjection(due.text).item).item.content
+  assert.ok(part.text.startsWith(due.text), 'the event itself is passed on unchanged')
+  assert.match(part.text, /time is up and what to do/, 'followed by the ask for a spoken sentence')
+  const result = gptLive1Provider.buildResultInjection('任务完成：报告已生成').item.content[0].text
+  assert.equal(result, '任务完成：报告已生成', 'other deliveries are untouched')
 })

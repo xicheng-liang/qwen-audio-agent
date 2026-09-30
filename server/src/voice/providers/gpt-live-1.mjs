@@ -349,7 +349,7 @@ export const gptLive1Provider = {
   // items so it can integrate them (and call respond_permission later); the
   // voice layer then speaks the backend's reply. No append size cap applies.
   buildResultInjection: content => ({
-    item: userTextItem(content),
+    item: userTextItem(withReminderDueHint(content)),
     response: {},
   }),
 
@@ -364,6 +364,19 @@ export const gptLive1Provider = {
     ].join('\n')),
     response: {},
   }),
+}
+
+// The backend tends to answer a due reminder with its bare content, which the
+// voice layer, paraphrasing, took for a request to set one. Ask for the
+// sentence to say instead.
+const REMINDER_DUE_EVENT = '<gateway_system_event type="reminder.due">'
+const REMINDER_DUE_HINT = 'The reminder is due now. Output only the one sentence to say to the user, '
+  + 'in the language of the conversation, saying that the time is up and what to do '
+  + '(for example: 时间到了，该喝水啦。).'
+
+export function withReminderDueHint(content) {
+  const text = String(content ?? '')
+  return text.includes(REMINDER_DUE_EVENT) ? `${text}\n${REMINDER_DUE_HINT}` : text
 }
 
 function userTextItem(text) {
