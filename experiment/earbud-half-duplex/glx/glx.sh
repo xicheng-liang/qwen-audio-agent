@@ -3,6 +3,8 @@
 # on first use and removed after 30 min without a connection. The 34.212 allocator sends a tenant
 # here when its route carries SIGMA_ROUTE_HOST=10.0.2.151 (allocator branch exp/gpt-live-route-host).
 #   ./glx.sh up | down | status | list | warm <tenant> | drop <tenant> | check <tenant> [hold_s] | logs [since]
+#   e2e through the entry: QAA_URL=ws://10.0.2.151:80/t/<tenant>/api/realtime QAA_ENV_FILE=conf/e2e.env \
+#     QAA_CONTAINER=qaa-glx-<tenant> ../exp/e2e/e2e.sh up 0
 # Entry 10.0.2.151:80, 34.212 and this box only, X-Qaa-Proxy must match:
 #   GET /t/<tenant>/api/realtime · POST /t/<tenant>/warm · POST /t/<tenant>/drop
 # Secrets are copied server-side into 600 files and never printed. down removes every container,
@@ -34,18 +36,20 @@ seed_env() {
 }
 
 write_conf() {
-  local v t
+  local v k
   (umask 077; mkdir -p conf)
   v=$(sudo grep -m1 '^QAA_PROXY_SECRET=' /srv/sigma-link/.env | cut -d= -f2- | tr -d "\r\n\"'")
   [ "${#v}" -ge 32 ] || { echo "proxy secret missing"; exit 1; }
-  t=$(grep -m1 '^QWEN_AUDIO_GATEWAY_ACCESS_TOKEN=' glx.env | cut -d= -f2- | tr -d "\r\n")
-  [ "${#t}" -ge 24 ] || { echo "glx.env has no access token"; exit 1; }
+  k=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
   umask 077
   printf 'map $http_x_qaa_proxy $gw_proxy_ok {\n  default 0;\n  "%s" 1;\n}\n' "$v" > conf/secret.conf
-  printf 'map $host $glx_bearer {\n  default "Bearer %s";\n}\n' "$t" > conf/bearer.conf
   printf '%s' "$v" > conf/marker
   printf 'X-Qaa-Proxy: %s\n' "$v" > conf/marker.hdr
-  unset v t
+  printf 'QAA_EXTRA_HEADERS={"X-Qaa-Proxy":"%s"}\n' "$v" > conf/e2e.env
+  printf '%s' "$k" > conf/doorman.key
+  printf 'map $host $glx_doorman_key {\n  default "%s";\n}\n' "$k" > conf/doorman.conf
+  printf 'X-Glx-Doorman: %s\n' "$k" > conf/doorman.hdr
+  unset v k
 }
 
 cmd_up() {
@@ -57,7 +61,7 @@ cmd_up() {
   fi
   [ -f glx.env ] || seed_env
   write_conf
-  sudo install -d -o root -g root -m 700 data
+  sudo install -d -o root -g root -m 700 data tokens
   sudo docker rm -f "$ENTRY" "$DOORMAN" >/dev/null 2>&1 || true
   sudo docker run -d --name "$DOORMAN" --restart unless-stopped --network host \
     -v /var/run/docker.sock:/var/run/docker.sock -v "$HERE:/glx" \
@@ -76,6 +80,12 @@ cmd_up() {
     --label trial.owner=xicheng --label trial.purpose=glx "$NGINX" >/dev/null
   sleep 1
   sudo docker exec "$ENTRY" nginx -t 2>&1 | tail -1
+  # nginx -t ignores a taken port; only a real answer from the entry proves it listens
+  local code restarts
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "$ENTRY_URL/" || true)
+  restarts=$(sudo docker inspect -f '{{.RestartCount}}' "$ENTRY")
+  [ "$code" = 404 ] && [ "$restarts" = 0 ] \
+    || { echo "entry not serving (http $code, restarts $restarts)"; sudo docker logs --tail 10 "$ENTRY"; exit 1; }
   echo "glx up: entry 10.0.2.151:80, doorman 127.0.0.1:4299, max ${GLX_MAX:-5}, idle ${GLX_IDLE_S:-1800}s"
 }
 
@@ -87,7 +97,7 @@ cmd_down() {
     # shellcheck disable=SC2086
     sudo docker rm -f $ids >/dev/null
   fi
-  sudo rm -rf data glx.env conf
+  sudo rm -rf data tokens glx.env conf
   if [ -f .pulled-python ]; then
     sudo docker rmi "$PY" >/dev/null 2>&1 || true
     rm -f .pulled-python
@@ -104,10 +114,12 @@ case "${1:-status}" in
   up) cmd_up ;;
   down) cmd_down ;;
   status)
-    sudo docker ps -a --filter label=trial.purpose=glx --filter label=trial.purpose=glx-tenant \
-      --format '{{.Names}} {{.Status}}'
+    # label filters AND together, so one query per purpose
+    for purpose in glx glx-tenant; do
+      sudo docker ps -a --filter "label=trial.purpose=$purpose" --format '{{.Names}} {{.Status}}'
+    done
     ;;
-  list) curl -s --max-time 5 http://127.0.0.1:4299/list; echo ;;
+  list) curl -s --max-time 5 -H @conf/doorman.hdr http://127.0.0.1:4299/list; echo ;;
   warm) tenant_arg "${2:-}"; post warm "$2" ;;
   drop) tenant_arg "${2:-}"; post drop "$2" ;;
   check)

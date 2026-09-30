@@ -1,13 +1,21 @@
 """Doorman for the GPT-Live earbud trial: one qaa container per tenant on this box, started on
-first use and removed after GLX_IDLE_S without a connection. Listens on 127.0.0.1 only. The entry
-nginx asks /ensure before it proxies a tenant's socket and forwards /warm and /drop to it."""
+first use and removed after GLX_IDLE_S without a connection. Listens on 127.0.0.1 only and
+answers only requests carrying the entry's key. The entry nginx asks /ensure before it proxies a
+tenant's socket and forwards /warm and /drop to it.
+
+Tenant containers run on the docker bridge, published on 127.0.0.1 only, each with its own access
+token: qaa then sees a non-loopback peer and enforces that token, so another process on this box
+cannot talk to a tenant's session."""
 from __future__ import annotations
 
+import contextlib
+import hmac
 import http.client
 import http.server
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import threading
@@ -24,6 +32,9 @@ IDLE_S = float(os.environ.get("GLX_IDLE_S", "1800"))
 SWEEP_S = float(os.environ.get("GLX_SWEEP_S", "60"))
 READY_S = float(os.environ.get("GLX_READY_S", "20"))
 LISTEN = ("127.0.0.1", int(os.environ.get("GLX_LISTEN_PORT", "4299")))
+KEY_FILE = f"{ROOT}/conf/doorman.key"
+TOKENS = f"{ROOT}/tokens"
+CONTAINER_PORT = 3000
 MEMORY_BYTES = 1024 * 1024 * 1024
 QAA_UID = 10001
 NAME_PREFIX = "qaa-glx-"
@@ -31,6 +42,8 @@ LABEL = "glx.tenant"
 TENANT_RE = re.compile(r"^[0-9a-f]{12}$")
 SOCKET_URI_RE = re.compile(r"^/t/([0-9a-f]{12})/api/realtime(?:\?.*)?$")
 ACTION_RE = re.compile(r"^/(warm|drop)/([0-9a-f]{12})$")
+# glx.env keys every tenant gets its own value for
+PER_TENANT = ("PORT", "HOST", "QWEN_AUDIO_GATEWAY_ACCESS_TOKEN")
 TCP_ESTABLISHED, TCP_LISTEN = "01", "0A"
 
 
@@ -88,11 +101,11 @@ def tcp_counts(ports: set[int]) -> tuple[dict[int, int], set[int]]:
     return established, listening
 
 
-def healthy(port: int, deadline: float) -> bool:
+def healthy(port: int, token: str, deadline: float) -> bool:
     while time.monotonic() < deadline:
         try:
             conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1.0)
-            conn.request("GET", "/api/health")
+            conn.request("GET", "/api/health", headers={"Authorization": f"Bearer {token}"})
             status = conn.getresponse().status
             conn.close()
             if status == 200:
@@ -103,19 +116,27 @@ def healthy(port: int, deadline: float) -> bool:
     return False
 
 
-def tenant_env(port: int) -> list[str]:
-    """glx.env as docker --env-file reads it (KEY=VALUE, literal), with this tenant's port."""
+def tenant_env(token: str) -> list[str]:
+    """glx.env as docker --env-file reads it (KEY=VALUE, literal), with this tenant's own values."""
     env: list[str] = []
     with open(f"{ROOT}/glx.env", encoding="utf-8") as fh:
         for line in fh:
             line = line.rstrip("\r\n")
             if not line or line.lstrip().startswith("#") or "=" not in line:
                 continue
-            if line.split("=", 1)[0].strip() == "PORT":
+            if line.split("=", 1)[0].strip() in PER_TENANT:
                 continue
             env.append(line)
-    env.append(f"PORT={port}")
-    return env
+    return env + ["HOST=0.0.0.0", f"PORT={CONTAINER_PORT}",
+                  f"QWEN_AUDIO_GATEWAY_ACCESS_TOKEN={token}"]
+
+
+def read_token(tenant: str) -> str:
+    try:
+        with open(f"{TOKENS}/{tenant}", encoding="ascii") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
 
 
 class Doorman:
@@ -138,17 +159,24 @@ class Doorman:
                                "state": row.get("State", "")}
         return out
 
-    def _create(self, tenant: str, port: int) -> None:
+    def _create(self, tenant: str, port: int) -> str:
         data = f"{ROOT}/data/{tenant}"
         shutil.rmtree(data, ignore_errors=True)
         os.makedirs(data, mode=0o700)
         os.chown(data, QAA_UID, QAA_UID)
+        token = secrets.token_urlsafe(32)
+        fd = os.open(f"{TOKENS}/{tenant}", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="ascii") as fh:
+            fh.write(token)
+        exposed = f"{CONTAINER_PORT}/tcp"
         spec = {
             "Image": IMAGE,
-            "Env": tenant_env(port),
+            "Env": tenant_env(token),
+            "ExposedPorts": {exposed: {}},
             "Labels": {"trial.owner": "xicheng", "trial.purpose": "glx-tenant",
                        LABEL: tenant, "glx.port": str(port)},
-            "HostConfig": {"NetworkMode": "host",
+            "HostConfig": {"PortBindings": {exposed: [{"HostIp": "127.0.0.1",
+                                                       "HostPort": str(port)}]},
                            "Binds": [f"{HOST_ROOT}/data/{tenant}:/data"],
                            "RestartPolicy": {"Name": "unless-stopped"},
                            "Memory": MEMORY_BYTES},
@@ -160,19 +188,24 @@ class Doorman:
         status, body = self.docker.call("POST", f"/containers/{NAME_PREFIX}{tenant}/start")
         if status not in (204, 304):
             raise RuntimeError(f"start: {status} {str(body)[:120]}")
+        return token
 
     def _remove(self, tenant: str) -> None:
         self.docker.call("DELETE", f"/containers/{NAME_PREFIX}{tenant}?force=1")   # 404 = gone
         shutil.rmtree(f"{ROOT}/data/{tenant}", ignore_errors=True)
+        with contextlib.suppress(OSError):
+            os.remove(f"{TOKENS}/{tenant}")
         self.last_used.pop(tenant, None)
 
-    def ensure(self, tenant: str) -> tuple[int, int, str]:
-        """(http status, port, reason): 200 once healthy · 403 full · 503 failed to come up."""
+    def ensure(self, tenant: str) -> tuple[int, int, str, str]:
+        """(http status, port, token, reason): 200 once healthy · 503 full or failed to come up.
+        Never 401/403: the gateway reads those as its own identity being refused."""
         try:
             with self.lock:
                 rows = self.tenants()
                 row = rows.get(tenant)
-                if row and row["state"] == "running" and row["port"]:
+                token = read_token(tenant) if row else ""
+                if row and row["state"] == "running" and row["port"] and token:
                     port = int(row["port"])  # type: ignore[arg-type]
                 else:
                     if row:                               # exited / half-made: start clean
@@ -180,25 +213,28 @@ class Doorman:
                         rows.pop(tenant)
                     if len(rows) >= MAX_TENANTS:
                         log("tenant.refused", tenant=tenant, reason="full", running=len(rows))
-                        return 403, 0, "full"
+                        return 503, 0, "", "full"
                     taken = {int(r["port"]) for r in rows.values()}  # type: ignore[arg-type]
                     _, listening = tcp_counts(set())
                     free = [p for p in range(PORT_LO, PORT_HI + 1)
                             if p not in taken and p not in listening]
                     if not free:
                         log("tenant.refused", tenant=tenant, reason="no_port")
-                        return 403, 0, "no_port"
+                        return 503, 0, "", "no_port"
                     port = free[0]
-                    self._create(tenant, port)
+                    token = self._create(tenant, port)
                     log("tenant.started", tenant=tenant, port=port)
-                self.last_used[tenant] = time.monotonic()
         except Exception as exc:  # noqa: BLE001
             log("tenant.error", tenant=tenant, error=f"{type(exc).__name__}: {str(exc)[:160]}")
-            return 503, 0, "error"
-        if not healthy(port, time.monotonic() + READY_S):
+            return 503, 0, "", "error"
+        if not healthy(port, token, time.monotonic() + READY_S):
             log("tenant.not_healthy", tenant=tenant, port=port)
-            return 503, port, "not_healthy"
-        return 200, port, ""
+            with self.lock:
+                self._remove(tenant)                      # the next ensure builds a fresh one
+            return 503, port, "", "not_healthy"
+        with self.lock:
+            self.last_used[tenant] = time.monotonic()
+        return 200, port, token, ""
 
     def drop(self, tenant: str) -> None:
         with self.lock:
@@ -230,7 +266,16 @@ class Doorman:
                 for t, r in sorted(rows.items())]
 
 
+def load_key() -> str:
+    try:
+        with open(KEY_FILE, encoding="ascii") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
 DOORMAN = Doorman(Docker())
+KEY = load_key()
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -239,40 +284,55 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         pass                                                     # our own log lines only
 
-    def _reply(self, status: int, body: object = None, port: int = 0) -> None:
+    def _reply(self, status: int, body: object = None, headers: dict[str, str] | None = None,
+               ) -> None:
         payload = json.dumps(body if body is not None else {}).encode()
         self.send_response(status)
-        if port:
-            self.send_header("X-Glx-Port", str(port))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
 
+    def _authorized(self) -> bool:
+        given = self.headers.get("X-Glx-Doorman", "")
+        return bool(KEY) and hmac.compare_digest(given.encode(), KEY.encode())
+
     def do_GET(self) -> None:  # noqa: N802
         path = urllib.parse.urlsplit(self.path).path
+        if path == "/healthz":
+            self._reply(200, {"ok": True, "keyed": bool(KEY)})
+            return
+        if not self._authorized():
+            self._reply(401)
+            return
         if path == "/ensure":
             match = SOCKET_URI_RE.match(self.headers.get("X-Original-URI", ""))
             if not match:
-                self._reply(403, {"reason": "bad_uri"})
+                self._reply(404, {"reason": "bad_uri"})
                 return
-            status, port, reason = DOORMAN.ensure(match.group(1))
-            self._reply(status, {"reason": reason} if reason else {}, port if status == 200 else 0)
-        elif path == "/healthz":
-            self._reply(200, {"ok": True})
+            status, port, token, reason = DOORMAN.ensure(match.group(1))
+            if status == 200:
+                self._reply(200, {}, {"X-Glx-Port": str(port), "X-Glx-Bearer": f"Bearer {token}"})
+            else:
+                self._reply(status, {"reason": reason})
         elif path == "/list":
             self._reply(200, DOORMAN.listing())
         else:
             self._reply(404)
 
     def do_POST(self) -> None:  # noqa: N802
+        if not self._authorized():
+            self._reply(401)
+            return
         match = ACTION_RE.match(urllib.parse.urlsplit(self.path).path)
         if not match:
             self._reply(404)
             return
         action, tenant = match.groups()
         if action == "warm":
-            status, _, reason = DOORMAN.ensure(tenant)
+            status, _, _, reason = DOORMAN.ensure(tenant)
             self._reply(status, {"reason": reason} if reason else {})
         else:
             DOORMAN.drop(tenant)
@@ -289,11 +349,12 @@ def sweep_forever() -> None:
 
 
 def main() -> None:
+    os.makedirs(TOKENS, mode=0o700, exist_ok=True)
     threading.Thread(target=sweep_forever, name="sweep", daemon=True).start()
     server = http.server.ThreadingHTTPServer(LISTEN, Handler)
     server.daemon_threads = True
     log("doorman.ready", listen=f"{LISTEN[0]}:{LISTEN[1]}", image=IMAGE, max=MAX_TENANTS,
-        idle_s=IDLE_S, ports=f"{PORT_LO}-{PORT_HI}")
+        idle_s=IDLE_S, ports=f"{PORT_LO}-{PORT_HI}", keyed=bool(KEY))
     server.serve_forever()
 
 

@@ -10,7 +10,9 @@
 #   ./e2e.sh status | down | clean down = remove gateway + its postgres/minio; clean = down + remove the image
 #
 # Knobs (env): LINGER=45 QUIET=20 (idle listen after each turn), HEAR=1 (transcribe clips after turns), CONNECT_AFTER_IDENTITY=true (prod value),
-#   NOTIFY_TAIL_PAD_MS=0 (prod pads 3000), QWEN_LOCALE=en-US, QWEN_TIME_ZONE=UTC, FORCE=1 (skip busy-qaa check).
+#   NOTIFY_TAIL_PAD_MS=0 (prod pads 3000), QWEN_LOCALE=en-US, QWEN_TIME_ZONE=UTC, FORCE=1 (skip busy-qaa check),
+#   QAA_URL=<ws url> (dial this instead of 127.0.0.1:<qaa_port>, skipping the health / cookie probe; pass it to
+#   turns too), QAA_ENV_FILE=<600 file> (extra gateway env lines, e.g. QAA_EXTRA_HEADERS carrying an entry's marker).
 #
 # Isolation: its own postgres and minio (tmpfs, bridge network, nothing published) because the gateway's
 # startup runs create_all + column auto-migrate + default-agent seed and creates its S3 bucket; neither
@@ -72,7 +74,8 @@ cmd_up() {
   local qport="${1:?usage: up <qaa_port>}" qc
   qc=$(qaa_container "$qport")
   sudo docker image inspect "$IMG" >/dev/null 2>&1 || die "no image $IMG - run: $0 build"
-  curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$qport/api/health" || die "qaa on :$qport not healthy"
+  [ -n "${QAA_URL:-}" ] || curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$qport/api/health" \
+    || die "qaa on :$qport not healthy"
   if ! sudo docker ps -q --filter "name=^${GW}$" | grep -q .; then
     ss -ltn | grep -qE "[:.]$PORT\s" && die "port $PORT already in use"
     ss -ltn | grep -qE "[:.]$METRICS_PORT\s" && die "metrics port $METRICS_PORT already in use"
@@ -119,8 +122,8 @@ cmd_up() {
   say "[up] gateway $GW on 127.0.0.1:$PORT -> qaa $qc (:$qport)"
   # Optional: a qaa in browser identity mode signs a cookie for loopback HTTP; personal mode signs none
   # and needs none. The value only ever goes into the 600 env file.
-  local cookie
-  cookie=$(curl -s -D- -o /dev/null --max-time 5 "http://127.0.0.1:$qport/" \
+  local cookie=""
+  [ -n "${QAA_URL:-}" ] || cookie=$(curl -s -D- -o /dev/null --max-time 5 "http://127.0.0.1:$qport/" \
            | tr -d '\r' | grep -i '^set-cookie: *qwen_audio_agent_identity=' | sed 's/^[^:]*: *//' | cut -d';' -f1 || true)
   (
     umask 077
@@ -142,9 +145,10 @@ cmd_up() {
       echo "DEVICE_WS_NOTIFY_TAIL_PAD_MS=${NOTIFY_TAIL_PAD_MS:-0}"
       echo "DEVICE_WS_QWEN_LOCALE=${QWEN_LOCALE:-en-US}"
       echo "DEVICE_WS_QWEN_TIME_ZONE=${QWEN_TIME_ZONE:-UTC}"
-      echo "QWEN_AUDIO_AGENT_WS_URL=ws://127.0.0.1:$qport/api/realtime"
+      echo "QWEN_AUDIO_AGENT_WS_URL=${QAA_URL:-ws://127.0.0.1:$qport/api/realtime}"
       echo "QWEN_AUDIO_AGENT_AUTH_SECRET=e2e-dummy-secret-at-least-32-characters"
       if [ -n "$cookie" ]; then echo "QAA_EXTRA_COOKIES=$cookie"; fi
+      if [ -n "${QAA_ENV_FILE:-}" ]; then cat "$QAA_ENV_FILE"; fi
     } > "$STATE/gw.env"
   )
   grep -qE '^PLAUD_ASR_URL=.+' "$STATE/gw.env" || die "PLAUD_ASR_URL missing from $REPO/.env"
@@ -189,7 +193,8 @@ cmd_turns() {
   sudo docker ps -q --filter "name=^${GW}$" | grep -q . || die "gateway not running - run: $0 up <qaa_port>"
   local qport qc busy
   qport=$(cat "$STATE/qaa_port"); qc=$(qaa_container "$qport")
-  curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$qport/api/health" || die "qaa on :$qport not healthy"
+  [ -n "${QAA_URL:-}" ] || curl -sf --max-time 5 -o /dev/null "http://127.0.0.1:$qport/api/health" \
+    || die "qaa on :$qport not healthy"
   busy=$(open_clients "$qc")
   if [ "$busy" != "0" ] && [ "${FORCE:-0}" != "1" ]; then
     die "$qc has $busy voice client(s) connected (browser?) - same ownerId as us; wait, or FORCE=1"
