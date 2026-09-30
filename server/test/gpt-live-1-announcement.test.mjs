@@ -24,7 +24,7 @@ async function until(predicate, ms = 2000) {
 // backend response takes the Gateway request, the voice segment is unsolicited.
 // The client stands in for the earbud gateway with no turn open: every
 // response.started (or unannounced audio) gets a playback.started receipt.
-function harness(t, { concurrentVoicePlayback = true, voiceAfterBackendDone = false } = {}) {
+function harness(t, { concurrentVoicePlayback = true, voiceAfterBackendDone = false, voiceFirst = false } = {}) {
   const ownerId = 'owner', sessionId = 'conversation'
   const events = [], frontends = [], runs = new Map()
   const manager = new TaskManager()
@@ -77,14 +77,14 @@ function harness(t, { concurrentVoicePlayback = true, voiceAfterBackendDone = fa
     }),
     realtimeFrontendFactory: options => {
       const emit = options.onEvent
-      const speak = async voice => {
+      const speak = async (voice, tags = { __voiceOrigin: 'model', __voiceContext: {} }) => {
         f.playbackResponses.add(voice)
-        emit({ type: 'response.created', response: { id: voice }, __voicePlayback: true, __unsolicited: true, __voiceOrigin: 'model', __voiceContext: {} })
+        emit({ type: 'response.created', response: { id: voice }, __voicePlayback: true, __unsolicited: true, ...tags })
         emit({ type: 'response.output_audio.delta', response_id: voice, delta: 'AAAA' })
         await sleep(5)
         emit({ type: 'response.output_audio_transcript.done', response_id: voice, transcript: 'Your tests: 39 of 42 passed.' })
         f.playbackResponses.delete(voice)
-        emit({ type: 'response.done', response: { id: voice, status: 'completed' }, __voicePlayback: true, __voiceOrigin: 'model', __voiceContext: {} })
+        emit({ type: 'response.done', response: { id: voice, status: 'completed' }, __voicePlayback: true, ...tags })
       }
       const f = {
         provider, capabilities: provider.capabilities, ready: false, deliveries: [], playbackResponses: new Set(),
@@ -96,6 +96,16 @@ function harness(t, { concurrentVoicePlayback = true, voiceAfterBackendDone = fa
           this.deliveries.push({ origin, context })
           const backend = `resp_${++sequence}`, voice = `voice_${sequence}`
           const tagged = { __voiceOrigin: origin, __voiceContext: { ...context } }
+          if (voiceFirst) {
+            // RealtimeFrontend tags speech that starts while the delivery waits for its backend step.
+            const speaking = speak(voice, tagged)
+            await sleep(10)
+            emit({ type: 'response.created', response: { id: backend }, ...tagged })
+            await sleep(5)
+            emit({ type: 'response.done', response: { id: backend, status: 'completed' }, ...tagged })
+            await speaking
+            return { completed: true, contextInjected: true }
+          }
           emit({ type: 'response.created', response: { id: backend }, ...tagged })
           await sleep(5)
           let speaking = null
@@ -174,5 +184,14 @@ test('without a concurrent voice layer the task result is confirmed by its own r
   assert.equal(f.deliveries.length, 1)
   assert.deepEqual(h.started()[0].origin, 'announcement')
   assert.equal(h.started()[0].responseId, 'resp_1')
+  assert.equal(h.manager.get(task.id).notificationStatus, 'delivered')
+})
+
+test('a task result the voice layer starts speaking before the backend step starts is delivered once and confirmed', async t => {
+  const h = harness(t, { voiceFirst: true })
+  const { f, task } = await completeTask(h)
+  assert.equal(f.deliveries.length, 1)
+  assert.deepEqual(h.started().map(event => [event.responseId, event.origin, event.taskIds]),
+    [['voice_1', 'announcement', [task.id]]])
   assert.equal(h.manager.get(task.id).notificationStatus, 'delivered')
 })

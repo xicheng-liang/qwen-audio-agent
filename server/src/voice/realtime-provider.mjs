@@ -111,6 +111,9 @@ const DEFAULT_CAPABILITIES = Object.freeze({
   concurrentVoicePlayback: false,
 })
 const DEFAULT_RESPONSE_CANCEL_GRACE_MS = 1_000
+// Gateway deliveries a concurrent voice layer may speak before their backend
+// step starts; a user question ('model') keeps its answer on the backend reply.
+const SPOKEN_DELIVERY_ORIGINS = new Set(['gateway-system-event', 'announcement', 'permission'])
 // Input events that count as session activity for idle close.
 const INPUT_ACTIVITY_TYPES = new Set([
   'input_audio_buffer.speech_started',
@@ -1022,9 +1025,17 @@ export class RealtimeFrontend {
         const index = this.pendingResponses.findIndex(item => item.responseRequested)
         if (index >= 0) pending = this.pendingResponses.splice(index, 1)[0]
       }
+      // Such speech while a Gateway delivery still waits for its backend step
+      // is that delivery being spoken: it takes the request's identity, without
+      // settling it, so the playback receipt confirms the delivery.
+      const spoken = !pending && event.__unsolicited && event.__voicePlayback
+        && this.capabilities.concurrentVoicePlayback
+        ? this.pendingResponses.find(item => item.responseRequested
+          && SPOKEN_DELIVERY_ORIGINS.has(item.origin) && item.isCurrent?.() !== false)
+        : null
       clearTimeout(pending?.timer)
-      event.__voiceOrigin = pending?.origin || 'model'
-      event.__voiceContext = { ...(pending?.context || {}), ...event.__voiceContext }
+      event.__voiceOrigin = pending?.origin || spoken?.origin || 'model'
+      event.__voiceContext = { ...(pending?.context || spoken?.context || {}), ...event.__voiceContext }
       if (pending?.isCurrent?.() === false) event.__voiceContext = { ...pending.context, suppressed: true }
       if (id) {
         this.activeResponses.add(id)

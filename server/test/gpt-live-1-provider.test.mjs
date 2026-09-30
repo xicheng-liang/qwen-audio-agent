@@ -2140,3 +2140,42 @@ test('a GPT-Live 1 request sent in the same tick as the cancel keeps the session
   assert.ok(!connections[0].received.some(message => message.type === 'session.close'))
   assert.equal(logs.find(([name]) => name === 'realtime.restart_skipped')[1].reason, 'frontend_busy')
 })
+
+test('GPT-Live 1 voice speech that starts before a delivery\'s backend step speaks for that delivery', { timeout: 10000 }, async t => {
+  withConfig(t, { gptLive1ApiKey: 'live-test', gptLive1Model: 'gpt-live-1' })
+  withEnv(t, { GPT_LIVE_1_DELEGATION_MODEL: 'gpt-5.6-terra', GPT_LIVE_1_OUTPUT_IDLE_MS: '40' })
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+  await new Promise(resolve => server.once('listening', resolve))
+  server.once('connection', socket => {
+    socket.on('message', raw => {
+      const message = JSON.parse(raw.toString())
+      if (message.type === 'session.start') {
+        socket.send(JSON.stringify({ type: 'session.started', session: { id: 'sess_1' } }))
+      } else if (message.type === 'response.create') {
+        // The backend is slow; the voice layer speaks the reminder at once.
+        socket.send(JSON.stringify({ type: 'session.output_audio.delta', delta: pcmFrame({ amplitude: 3000 }) }))
+        setTimeout(() => {
+          socket.send(JSON.stringify({ type: 'response.event', delegation_id: 'del_1', event: { type: 'response.created', response: { id: 'resp_1' } } }))
+          socket.send(JSON.stringify({ type: 'response.event', delegation_id: 'del_1', event: { type: 'response.completed', response: { id: 'resp_1', status: 'completed' } } }))
+        }, 100)
+      }
+    })
+  })
+  withConfig(t, { gptLive1RealtimeUrl: `ws://127.0.0.1:${server.address().port}/v1/live/sessions` })
+  const events = []
+  const frontend = new RealtimeFrontend({ provider: gptLive1Provider, agentContext: {}, onEvent: event => events.push(event), responseStartTimeoutMs: 2000 })
+  t.after(async () => {
+    frontend.close()
+    await new Promise(resolve => server.close(resolve))
+  })
+  await frontend.connect()
+  const outcome = await frontend.injectDelivery('<gateway_system_event type="reminder.due"/>', 'gateway-system-event',
+    { turnId: 'gateway_1', taskId: 'task_1' }, { route: 'respond' })
+  const voice = events.find(event => event.type === 'response.created' && event.__voicePlayback)
+  assert.equal(voice.__voiceOrigin, 'gateway-system-event')
+  assert.equal(voice.__voiceContext.taskId, 'task_1')
+  assert.equal(voice.__voiceContext.turnId, 'gateway_1')
+  const backend = events.find(event => event.type === 'response.created' && !event.__voicePlayback)
+  assert.equal(backend.__voiceOrigin, 'gateway-system-event', 'the request is still settled by its backend step')
+  assert.equal(outcome.completed, true)
+})
