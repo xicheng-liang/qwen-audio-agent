@@ -53,7 +53,8 @@ qaa_container() {
 # gives every loopback / Bearer client the same ownerId (user_personal), so a browser on the compare
 # page and this gateway would fight over one voice slot.
 open_clients() {
-  sudo docker logs "$1" 2>&1 \
+  # no such container yet (an entry that creates it on first dial) = nobody connected
+  { sudo docker logs "$1" 2>&1 || true; } \
     | awk '/voice_client\.connected/{n++} /voice_client\.disconnected/{if(n>0)n--} END{print n+0}'
 }
 
