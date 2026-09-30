@@ -196,6 +196,12 @@ function dropCancelledTail() {
   return String(process.env.GPT_LIVE_1_DROP_CANCELLED_TAIL || '').trim() === '1'
 }
 
+// Close and reopen the Live session when a Gateway cancel cuts speech with no
+// backend work in flight (off by default): the voice layer keeps talking otherwise.
+function restartOnCancel() {
+  return String(process.env.GPT_LIVE_1_RESTART_ON_CANCEL || '').trim() === '1'
+}
+
 // Fixed gain on the voice output, 0.25 to 4 (default 1). Measured on the earbud:
 // about 6 dB below the other providers, with about 10 dB of peak headroom.
 function outputGain() {
@@ -242,8 +248,11 @@ function rememberRejectedHistory(input) {
   }
 }
 
-function seededHistory(recentMessages) {
+// trimTrailingUser: a seed that ends with the user's message is answered at
+// session start, so a reopen after a cancel drops the unanswered question.
+function seededHistory(recentMessages, { trimTrailingUser = false } = {}) {
   const input = sessionInputHistory(recentMessages)
+  while (trimTrailingUser && input.at(-1)?.role === 'user') input.pop()
   if (input.length && rejectedHistories.delete(historyKey(input))) return []
   return input
 }
@@ -260,6 +269,7 @@ export const gptLive1Provider = {
     outputIdleMs: outputIdleMs(),
     dropSpontaneousSpeech: dropSpontaneousSpeech(),
     dropCancelledTail: dropCancelledTail(),
+    restartOnCancel: restartOnCancel(),
     outputGain: outputGain(),
     itemMaxBytes: backendItemMaxBytes(),
     standingInstructions: STANDING_RESPONSE_INSTRUCTIONS,
@@ -322,7 +332,9 @@ export const gptLive1Provider = {
 
   buildSession: ({ agentContext, sessionOptions }) => {
     const voice = String(sessionOptions?.voice || config.gptLive1Voice || '').trim()
-    const input = seededHistory(agentContext?.recentMessages)
+    const input = seededHistory(agentContext?.recentMessages, {
+      trimTrailingUser: sessionOptions?.trimTrailingUser === true,
+    })
     return {
       model: config.gptLive1Model,
       instructions: voiceInstructions(agentContext),

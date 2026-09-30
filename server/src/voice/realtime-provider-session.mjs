@@ -76,6 +76,8 @@ export class RealtimeProviderSession {
     this.parked = false
     this.idleTimer = null
     this.idleBlocker = ''
+    // Set by a restart after cancel, for the next connect's history seed only.
+    this.trimSeedOnce = false
   }
 
   get ready() {
@@ -208,11 +210,14 @@ export class RealtimeProviderSession {
     const connectStartedAt = Date.now()
     this.logger.info('realtime.connecting', { provider: this.providerKey })
     let createdFrontend
+    const sessionOptions = this.getSessionOptions() || {}
+    const trimTrailingUser = this.trimSeedOnce
+    this.trimSeedOnce = false
     createdFrontend = this.createFrontend({
       providerName: this.providerKey,
       providerRegistry: this.providerRegistry,
       agentContext: this.getAgentContext(),
-      sessionOptions: this.getSessionOptions(),
+      sessionOptions: trimTrailingUser ? { ...sessionOptions, trimTrailingUser } : sessionOptions,
       onEvent: event => {
         if (this.frontend === createdFrontend) this.onEvent(event)
       },
@@ -222,6 +227,7 @@ export class RealtimeProviderSession {
       },
       onError: error => this.#handleProviderError(createdFrontend, error),
       onClose: () => this.#handleClose(createdFrontend),
+      onRestartRequested: () => this.#restartAfterCancel(createdFrontend),
     })
     this.frontend = createdFrontend
     let createdConnectPromise
@@ -443,6 +449,31 @@ export class RealtimeProviderSession {
     this.connectedAt = 0
     this.idleBlocker = ''
     this.parked = true
+  }
+
+  // Closes the provider session and reopens it at once with no client event,
+  // for a provider whose speech a cancel cannot stop. A tick later, so the cut
+  // answer's transcript is in history before the new session is seeded; the
+  // seed drops a trailing unanswered question, which the service would answer.
+  #restartAfterCancel(frontend) {
+    const timer = setTimeout(() => {
+      if (this.frontend !== frontend || !frontend.ready || this.connectPromise
+        || this.scheduledReconnect || this.blockedError) return
+      this.logger.info('realtime.restarted_after_cancel', {
+        provider: frontend.provider.key,
+        connectedMs: this.connectedAt ? Date.now() - this.connectedAt : 0,
+      })
+      this.detach({ clearAudio: false })
+      this.connectedAt = 0
+      this.idleBlocker = ''
+      this.parked = true
+      this.trimSeedOnce = true
+      this.ensure().catch(error => this.logger.warn('realtime.restart_failed', {
+        provider: frontend.provider.key,
+        error,
+      }))
+    }, 0)
+    timer.unref?.()
   }
 
   detach({ clearAudio = true, notifyDisconnected = false } = {}) {

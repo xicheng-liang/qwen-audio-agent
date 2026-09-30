@@ -127,6 +127,7 @@ export class RealtimeFrontend {
     onClose,
     onDiagnostic,
     onResponseSettled,
+    onRestartRequested,
     agentContext = {},
     sessionOptions = {},
     responseStartTimeoutMs,
@@ -160,6 +161,7 @@ export class RealtimeFrontend {
     this.onClose = onClose
     this.onDiagnostic = onDiagnostic
     this.onResponseSettled = onResponseSettled
+    this.onRestartRequested = onRestartRequested
     this.agentContext = agentContext
     this.sessionOptions = sessionOptions
     this.ws = null
@@ -759,6 +761,8 @@ export class RealtimeFrontend {
       // Gateway requests waiting on them, keep running as they do on the service.
       this.protocol.responseCancel()
       this.resolveIdle()
+      // A protocol whose speech a cancel cannot stop asks for a fresh session.
+      if (this.protocol.takeRestartRequest?.() && !this.pendingResponses.length) this.onRestartRequested?.()
       return
     }
     this.responseQueueGeneration += 1

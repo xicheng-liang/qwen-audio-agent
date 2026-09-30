@@ -1966,3 +1966,85 @@ test('GPT-Live 1 asks the backend for the sentence to say when a reminder is due
   const result = gptLive1Provider.buildResultInjection('任务完成：报告已生成').item.content[0].text
   assert.equal(result, '任务完成：报告已生成', 'other deliveries are untouched')
 })
+
+test('GPT-Live 1 asks for a fresh session when a cancel cuts speech with no backend work in flight', t => {
+  const idle = cancelHarness(t, { restartOnCancel: true })
+  idle.voiced()
+  idle.protocol.responseCancel()
+  assert.equal(idle.protocol.takeRestartRequest(), true)
+  assert.equal(idle.protocol.takeRestartRequest(), false, 'read once')
+
+  t.mock.timers.reset()
+  const busy = cancelHarness(t, { restartOnCancel: true })
+  busy.protocol.encodeOutgoing({ type: 'response.create' })
+  busy.voiced()
+  busy.protocol.responseCancel()
+  assert.equal(busy.protocol.takeRestartRequest(), false, 'closing would drop the delegated work')
+
+  t.mock.timers.reset()
+  const silent = cancelHarness(t, { restartOnCancel: true })
+  silent.protocol.responseCancel()
+  assert.equal(silent.protocol.takeRestartRequest(), false, 'nothing was being said')
+
+  t.mock.timers.reset()
+  const off = cancelHarness(t)
+  off.voiced()
+  off.protocol.responseCancel()
+  assert.equal(off.protocol.takeRestartRequest(), false, 'off by default')
+})
+
+test('a GPT-Live 1 cancel of speech reopens the session silently, without the unanswered question', { timeout: 10000 }, async t => {
+  withEnv(t, { GPT_LIVE_1_RESTART_ON_CANCEL: '1' })
+  const speech = pcmFrame({ amplitude: 3000 })
+  const { connections } = await liveMockServer(t, (message, connection) => {
+    if (message.type === 'session.start' && connections.length === 1) {
+      connection.socket.send(JSON.stringify({ type: 'session.output_audio.delta', delta: speech }))
+    }
+  })
+  const history = [
+    { role: 'user', content: '简单讲讲黑洞是什么' },
+    { role: 'assistant', content: '黑洞是引力' },
+    { role: 'user', content: '一加一等于几' },
+  ]
+  const states = []
+  const readies = []
+  const logs = []
+  const events = []
+  const session = new RealtimeProviderSession({
+    providerRegistry: { resolve: () => gptLive1Provider },
+    defaultProvider: 'gpt-live-1',
+    getAgentContext: () => ({ recentMessages: history }),
+    shouldReconnect: () => true,
+    onEvent: event => events.push(event),
+    onDiagnostic: () => {},
+    onConnected: () => {},
+    onReady: (_frontend, info) => readies.push(info),
+    onDisconnected: () => states.push({ state: 'disconnected' }),
+    onReconnected: () => {},
+    onConnectionState: state => states.push(state),
+    onError: error => states.push({ state: 'error', message: error.message }),
+    onReconnectError: () => {},
+    logger: { info: (name, fields) => logs.push([name, fields]), warn: () => {}, error: () => {} },
+  })
+  t.after(() => session.close())
+  await session.ensure()
+  await until(() => events.some(event => event.type === 'response.output_audio.delta'))
+  const firstSeed = connections[0].received[0].session.input
+  assert.equal(firstSeed.at(-1).content[0].text, '一加一等于几', 'a normal connect seeds the whole history')
+
+  session.cancelResponse()
+  await until(() => connections.length === 2 && connections[1].received.length > 0)
+  assert.ok(connections[0].received.some(message => message.type === 'session.close'), 'the talking session is closed')
+  await until(() => readies.length === 2)
+  const reseed = connections[1].received[0]
+  assert.equal(reseed.type, 'session.start')
+  assert.deepEqual(reseed.session.input.map(message => message.role), ['user', 'assistant'],
+    'the reopened session is not left an unanswered question to answer on start')
+  assert.deepEqual(states.map(state => state.state), ['connecting', 'connected'], 'the restart is invisible to the client')
+  assert.deepEqual(readies, [{ resumedFromPark: false }, { resumedFromPark: true }])
+  assert.ok(logs.some(([name]) => name === 'realtime.restarted_after_cancel'))
+
+  session.cancelResponse()
+  await new Promise(resolve => setTimeout(resolve, 200))
+  assert.equal(connections.length, 2, 'a cancel with nothing being said does not restart')
+})

@@ -374,10 +374,15 @@ export function createGptLive1Protocol({
   resultRelayMs = DEFAULT_RESULT_RELAY_MS,
   dropSpontaneousSpeech = false,
   dropCancelledTail = false,
+  restartOnCancel = false,
   outputGain = 1,
   now = () => performance.now(),
 } = {}) {
   let voiceResponseId = ''
+  // With restartOnCancel, a Gateway cancel of speech with no backend work in
+  // flight asks for a fresh session: closing it is the only way to stop the
+  // voice layer finishing the cut answer.
+  let restartWanted = false
   // Set by a Gateway cancel with dropCancelledTail; see CANCEL_TAIL_QUIET_MS.
   let cancelTail = false
   let cancelTailVoicedAt = 0
@@ -1273,16 +1278,27 @@ export function createGptLive1Protocol({
     correlateResponseCreate: payload => payload,
     responseCorrelationId: () => '',
 
+    // Read once by the frontend right after a cancel.
+    takeRestartRequest: () => {
+      const wanted = restartWanted
+      restartWanted = false
+      return wanted
+    },
+
     // The Live model owns turn-taking and barge-in; there is no client cancel.
     // A Gateway cancel closes the adapter's playback records so the runtime
     // frees them; backend responses keep running as they do on the service.
     // The close is delivered asynchronously like a wire event.
     responseCancel: () => {
-      if (dropCancelledTail && voiceResponseId) {
+      const speaking = Boolean(voiceResponseId)
+      if (dropCancelledTail && speaking) {
         cancelTail = true
         cancelTailVoicedAt = now()
         cancelTailRequestAt = 0
       }
+      // Closing the session would drop delegated work, so only when none runs.
+      restartWanted = restartOnCancel && speaking && backendResponses.size === 0
+        && pendingFunctionCalls.size === 0 && !awaitingBackend && commentaryRequests.size === 0
       clearOutputIdle()
       // What was heard of the cut segment is recorded once, as on a barge-in,
       // and none of it is carried into the next answer.

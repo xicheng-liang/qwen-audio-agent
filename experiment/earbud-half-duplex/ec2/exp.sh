@@ -11,11 +11,12 @@ cd /srv/qaa-trial/exp
 case "${1:-status}" in
   up)
     sudo docker image inspect qaa:gpt-live-1-exp >/dev/null 2>&1 || ./run-exp.sh build
-    # exp.env is re-seeded from trial.env when missing; the two tuning keys are not in it.
+    # exp.env is re-seeded from trial.env when missing; the tuning keys are not in it.
     ./run-exp.sh env-set GPT_LIVE_1_IDLE_CLOSE_MS 30000
     ./run-exp.sh env-set GPT_LIVE_1_DROP_SPONTANEOUS_SPEECH 1
     ./run-exp.sh env-set GPT_LIVE_1_DROP_CANCELLED_TAIL 1
     ./run-exp.sh env-set GPT_LIVE_1_OUTPUT_GAIN 2
+    ./run-exp.sh env-set GPT_LIVE_1_RESTART_ON_CANCEL 1
     ./run-exp.sh start
     gw-entry/gw-entry.sh start exp
     ;;

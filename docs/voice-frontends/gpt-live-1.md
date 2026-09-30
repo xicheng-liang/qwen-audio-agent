@@ -33,6 +33,7 @@ OPENAI_API_KEY=your-openai-key
 | `GPT_LIVE_1_DROP_SPONTANEOUS_SPEECH` | off | Set to `1` to drop speech the voice layer starts on its own while a text-only client (no input audio for 10 s) has nothing pending, such as a stray backchannel after an answer |
 | `GPT_LIVE_1_DROP_CANCELLED_TAIL` | off | Set to `1` to drop the rest of an answer a Gateway cancel cut, until the voice pauses for 700 ms or 2.5 s after the next request. A text-only client cannot barge in on the service, so the voice would otherwise finish the cut answer at the start of the next one |
 | `GPT_LIVE_1_OUTPUT_GAIN` | `1` | Fixed gain on the voice output, `0.25` to `4`, clipped at full scale. Silence is judged before the gain |
+| `GPT_LIVE_1_RESTART_ON_CANCEL` | off | Set to `1` to close and silently reopen the Live session when a Gateway cancel cuts speech with no backend work in flight. The reopened session is not seeded with a trailing unanswered question. A text-only client cannot barge in on the service, which otherwise keeps finishing the cut answer for as long as it takes |
 
 Desktop exposes the endpoint, key, model, and voice fields under
 **Voice frontend → GPT-Live 1**. Restart a terminal Gateway after editing the
