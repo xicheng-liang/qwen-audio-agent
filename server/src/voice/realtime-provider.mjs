@@ -149,6 +149,10 @@ export class RealtimeFrontend {
         // A protocol may also send a wire event of its own, e.g. to replace a
         // tool result the service rejected before the runtime's next command.
         send: (payload, options) => this.send(payload, options),
+        // A protocol whose speech a cancel cannot stop asks for a fresh session.
+        requestRestart: () => {
+          if (this.restartSafe()) this.onRestartRequested?.()
+        },
       }) ?? provider.protocol,
       provider.key || provider.label,
     )
@@ -755,14 +759,18 @@ export class RealtimeFrontend {
     this.send(this.protocol.responseCreate(response))
   }
 
+  // Nothing queued here or running on the service that a new session would lose.
+  restartSafe() {
+    return !this.pendingResponses.length && !this.retryingResponses.size
+      && this.protocol.restartSafe?.() !== false
+  }
+
   cancel() {
     if (this.capabilities.concurrentVoicePlayback) {
       // User speech interrupts playback only: backend responses, and the
       // Gateway requests waiting on them, keep running as they do on the service.
       this.protocol.responseCancel()
       this.resolveIdle()
-      // A protocol whose speech a cancel cannot stop asks for a fresh session.
-      if (this.protocol.takeRestartRequest?.() && !this.pendingResponses.length) this.onRestartRequested?.()
       return
     }
     this.responseQueueGeneration += 1

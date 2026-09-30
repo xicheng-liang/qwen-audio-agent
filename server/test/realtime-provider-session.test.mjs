@@ -564,3 +564,38 @@ test('providers without idleCloseMs, or sessions without a blocker, never close 
     runtime.close()
   }
 })
+
+test('a restart after cancel is skipped while work above the provider would be lost', async () => {
+  const { runtime, calls, frontends } = harness({ connectMode: 'resolve', restartBlocker: () => 'active_task' })
+  await runtime.ensure()
+  frontends[0].options.onRestartRequested()
+  await new Promise(resolve => setTimeout(resolve, 5))
+  assert.equal(frontends.length, 1)
+  assert.ok(!calls.some(call => call[0] === 'close'))
+  assert.ok(calls.some(call => call[0] === 'log.info' && call[1] === 'realtime.restart_skipped' && call[2].reason === 'active_task'))
+})
+
+test('a restart after cancel reopens silently, and a failed reopen keeps the seed trim for the next wake', async () => {
+  const { runtime, calls, frontends } = harness({ sessionOptions: { voice: 'v' } })
+  const first = runtime.ensure()
+  frontends[0].resolveConnect()
+  await first
+  const statesBefore = calls.filter(call => call[0] === 'state').length
+  frontends[0].options.onRestartRequested()
+  await new Promise(resolve => setTimeout(resolve, 5))
+  assert.ok(calls.some(call => call[0] === 'close'), 'the talking session is closed')
+  assert.equal(frontends.length, 2)
+  assert.deepEqual(frontends[1].options.sessionOptions, { voice: 'v', trimTrailingUser: true })
+  frontends[1].rejectConnect(new Error('connect failed'))
+  await new Promise(resolve => setTimeout(resolve, 5))
+  assert.equal(runtime.parked, true, 'a transient failure stays parked')
+  const wake = runtime.ensure()
+  frontends[2].resolveConnect()
+  await wake
+  assert.deepEqual(frontends[2].options.sessionOptions, { voice: 'v', trimTrailingUser: true }, 'the next wake still drops the cut question')
+  const later = runtime.ensure()
+  await later
+  assert.equal(calls.filter(call => call[0] === 'state').length, statesBefore, 'no connection state reached the client')
+  assert.deepEqual(calls.filter(call => call[0] === 'onReady').map(call => call[1]),
+    [{ resumedFromPark: false }, { resumedFromPark: true }])
+})

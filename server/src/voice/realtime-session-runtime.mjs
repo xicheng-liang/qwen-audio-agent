@@ -308,6 +308,14 @@ export function createRealtimeSessionRuntime({
                   : taskCoordinator.activeTasks().length ? 'active_task'
                     : announcements.isIdle?.() !== true ? 'announcement' : ''
     ),
+    // A restart after cancel happens mid-turn, so the turn and playback checks
+    // above do not apply; the rest would be lost with the old session.
+    restartBlocker: () => (
+      closed ? 'closed'
+        : toolCallTimings.size ? 'tool_call'
+          : taskCoordinator.activeTasks().length ? 'active_task'
+            : announcements.isIdle?.() !== true ? 'announcement' : ''
+    ),
     ...(realtimeFrontendFactory
       ? { createFrontend: realtimeFrontendFactory }
       : {}),

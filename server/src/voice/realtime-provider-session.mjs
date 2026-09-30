@@ -39,6 +39,8 @@ export class RealtimeProviderSession {
     reconnectBackoff = new ReconnectBackoff(),
     // '' when an idle provider session may close, otherwise the reason it may not.
     idleCloseBlocker = () => 'disabled',
+    // The same for a restart after cancel, which happens mid-conversation.
+    restartBlocker = () => '',
     now = () => performance.now(),
   }) {
     this.providerRegistry = providerRegistry
@@ -70,6 +72,7 @@ export class RealtimeProviderSession {
     this.blockedError = ''
     this.inputMuted = false
     this.idleCloseBlocker = idleCloseBlocker
+    this.restartBlocker = restartBlocker
     this.now = now
     // Parked: the provider session was closed while idle and reopens on the
     // next request, with no connection state change reported to the client.
@@ -277,6 +280,8 @@ export class RealtimeProviderSession {
           // stay parked, report no connection state, and let the caller report it.
           this.frontend = null
           this.parked = true
+          // The next wake still seeds without the cut question.
+          if (trimTrailingUser) this.trimSeedOnce = true
           createdFrontend.close()
           this.logger.warn('realtime.unpark_failed', {
             provider: createdFrontend.provider.key,
@@ -459,6 +464,18 @@ export class RealtimeProviderSession {
     const timer = setTimeout(() => {
       if (this.frontend !== frontend || !frontend.ready || this.connectPromise
         || this.scheduledReconnect || this.blockedError) return
+      // A request sent in the same tick, or work above the provider the new
+      // session would not know about, keeps the session.
+      let blocker = frontend.restartSafe?.() === false ? 'frontend_busy' : ''
+      try {
+        blocker ||= String(this.restartBlocker() || '')
+      } catch {
+        blocker = 'blocker_threw'
+      }
+      if (blocker) {
+        this.logger.info('realtime.restart_skipped', { provider: frontend.provider.key, reason: blocker })
+        return
+      }
       this.logger.info('realtime.restarted_after_cancel', {
         provider: frontend.provider.key,
         connectedMs: this.connectedAt ? Date.now() - this.connectedAt : 0,

@@ -375,14 +375,16 @@ export function createGptLive1Protocol({
   dropSpontaneousSpeech = false,
   dropCancelledTail = false,
   restartOnCancel = false,
+  requestRestart = null,
   outputGain = 1,
   now = () => performance.now(),
 } = {}) {
   let voiceResponseId = ''
-  // With restartOnCancel, a Gateway cancel of speech with no backend work in
-  // flight asks for a fresh session: closing it is the only way to stop the
-  // voice layer finishing the cut answer.
-  let restartWanted = false
+  // With restartOnCancel, a Gateway cancel of speech arms a request for a fresh
+  // session: closing it is the only way to stop the voice layer finishing the
+  // cut answer. It fires once no backend work is in flight, and a new request
+  // on this session disarms it.
+  let restartArmed = false
   // Set by a Gateway cancel with dropCancelledTail; see CANCEL_TAIL_QUIET_MS.
   let cancelTail = false
   let cancelTailVoicedAt = 0
@@ -735,17 +737,31 @@ export function createGptLive1Protocol({
     return false
   }
 
+  // Closing the session would drop delegated work or a result not yet spoken.
+  const backendIdle = () => backendResponses.size === 0 && pendingFunctionCalls.size === 0
+    && !awaitingBackend && commentaryRequests.size === 0 && !(now() < voiceOwedUntil) && !relayTimer
+
+  const maybeRestart = () => {
+    if (!restartArmed || !backendIdle() || typeof requestRestart !== 'function') return
+    restartArmed = false
+    requestRestart()
+  }
+
   // Output still belonging to an answer a Gateway cancel cut; a spoken frame
-  // keeps the drop going.
+  // keeps the drop going, and retries an armed restart.
   const cancelledTail = voiced => {
     if (!cancelTail) return false
     const at = now()
     if (at - cancelTailVoicedAt >= CANCEL_TAIL_QUIET_MS
       || (cancelTailRequestAt && at - cancelTailRequestAt >= CANCEL_TAIL_MAX_AFTER_REQUEST_MS)) {
       cancelTail = false
+      restartArmed = false
       return false
     }
-    if (voiced) cancelTailVoicedAt = at
+    if (voiced) {
+      cancelTailVoicedAt = at
+      maybeRestart()
+    }
     return true
   }
 
@@ -1143,6 +1159,9 @@ export function createGptLive1Protocol({
       if (payload == null) return null
       const encoded = { event_id: eventId(), ...payload }
       if (payload.type === 'response.create') awaitingBackend = true
+      if (['response.create', 'response.item.create', 'session.commentary.append'].includes(payload.type)) {
+        restartArmed = false
+      }
       if (cancelTail && !cancelTailRequestAt
         && (payload.type === 'response.create' || payload.type === 'session.commentary.append')) {
         cancelTailRequestAt = now()
@@ -1278,27 +1297,23 @@ export function createGptLive1Protocol({
     correlateResponseCreate: payload => payload,
     responseCorrelationId: () => '',
 
-    // Read once by the frontend right after a cancel.
-    takeRestartRequest: () => {
-      const wanted = restartWanted
-      restartWanted = false
-      return wanted
-    },
+    // Checked again by the session when the requested restart runs.
+    restartSafe: () => backendIdle(),
 
     // The Live model owns turn-taking and barge-in; there is no client cancel.
     // A Gateway cancel closes the adapter's playback records so the runtime
     // frees them; backend responses keep running as they do on the service.
     // The close is delivered asynchronously like a wire event.
     responseCancel: () => {
+      // A cut answer still streaming under the tail drop is speech as well.
       const speaking = Boolean(voiceResponseId)
+        || (cancelTail && now() - cancelTailVoicedAt < CANCEL_TAIL_QUIET_MS)
       if (dropCancelledTail && speaking) {
         cancelTail = true
         cancelTailVoicedAt = now()
         cancelTailRequestAt = 0
       }
-      // Closing the session would drop delegated work, so only when none runs.
-      restartWanted = restartOnCancel && speaking && backendResponses.size === 0
-        && pendingFunctionCalls.size === 0 && !awaitingBackend && commentaryRequests.size === 0
+      if (restartOnCancel && speaking) restartArmed = true
       clearOutputIdle()
       // What was heard of the cut segment is recorded once, as on a barge-in,
       // and none of it is carried into the next answer.
@@ -1324,6 +1339,7 @@ export function createGptLive1Protocol({
           }
         })
       }
+      maybeRestart()
       return null
     },
 

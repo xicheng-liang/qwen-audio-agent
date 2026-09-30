@@ -1967,30 +1967,84 @@ test('GPT-Live 1 asks the backend for the sentence to say when a reminder is due
   assert.equal(result, '任务完成：报告已生成', 'other deliveries are untouched')
 })
 
+function restartHarness(t, options = {}) {
+  const requests = []
+  const h = cancelHarness(t, { restartOnCancel: true, requestRestart: () => requests.push(1), ...options })
+  const backend = (delegationId, nested) => h.protocol.normalizeIncoming({
+    type: 'response.event', delegation_id: delegationId, event: nested,
+  })
+  return { ...h, requests, backend }
+}
+
 test('GPT-Live 1 asks for a fresh session when a cancel cuts speech with no backend work in flight', t => {
-  const idle = cancelHarness(t, { restartOnCancel: true })
+  const idle = restartHarness(t)
   idle.voiced()
   idle.protocol.responseCancel()
-  assert.equal(idle.protocol.takeRestartRequest(), true)
-  assert.equal(idle.protocol.takeRestartRequest(), false, 'read once')
+  assert.equal(idle.requests.length, 1)
+  idle.advance(100)
+  idle.voiced()
+  assert.equal(idle.requests.length, 1, 'asked once per cancel')
 
   t.mock.timers.reset()
-  const busy = cancelHarness(t, { restartOnCancel: true })
-  busy.protocol.encodeOutgoing({ type: 'response.create' })
-  busy.voiced()
-  busy.protocol.responseCancel()
-  assert.equal(busy.protocol.takeRestartRequest(), false, 'closing would drop the delegated work')
-
-  t.mock.timers.reset()
-  const silent = cancelHarness(t, { restartOnCancel: true })
+  const silent = restartHarness(t)
   silent.protocol.responseCancel()
-  assert.equal(silent.protocol.takeRestartRequest(), false, 'nothing was being said')
+  assert.equal(silent.requests.length, 0, 'nothing was being said')
 
   t.mock.timers.reset()
-  const off = cancelHarness(t)
+  const off = restartHarness(t, { restartOnCancel: false })
   off.voiced()
   off.protocol.responseCancel()
-  assert.equal(off.protocol.takeRestartRequest(), false, 'off by default')
+  assert.equal(off.requests.length, 0, 'off by default')
+})
+
+test('GPT-Live 1 asks for a fresh session only once delegated work has finished', t => {
+  const h = restartHarness(t)
+  h.protocol.normalizeIncoming({ type: 'session.delegation.created', delegation: { id: 'del_1', response_id: 'resp_1' } })
+  h.voiced()
+  h.protocol.responseCancel()
+  for (let i = 0; i < 10; i += 1) {
+    h.advance(100)
+    h.voiced()
+  }
+  assert.equal(h.requests.length, 0, 'closing would drop the running delegation')
+  h.backend('del_1', { type: 'response.completed', response: { id: 'resp_1', status: 'completed' } })
+  for (let i = 0; i < 40 && !h.requests.length; i += 1) {
+    h.advance(100)
+    h.voiced()
+  }
+  assert.equal(h.requests.length, 1, 'the cut answer still streaming asks once the work is done')
+})
+
+test('GPT-Live 1 treats a cut answer still streaming as speech, and a new request disarms the restart', t => {
+  const h = restartHarness(t)
+  h.voiced()
+  h.protocol.encodeOutgoing({ type: 'response.create' })
+  h.protocol.responseCancel()
+  assert.equal(h.requests.length, 0, 'a backend response was requested')
+  // Context for the backend disarms the first cut; the voice keeps finishing it.
+  h.protocol.encodeOutgoing({ type: 'response.item.create', item: { type: 'message', role: 'user', content: [] } })
+  h.backend('del_1', { type: 'response.created', response: { id: 'resp_1' } })
+  h.backend('del_1', { type: 'response.completed', response: { id: 'resp_1', status: 'completed' } })
+  for (let i = 0; i < 45; i += 1) {
+    h.advance(100)
+    assert.deepEqual(h.voiced(), [], 'the cut answer is still dropped')
+  }
+  assert.equal(h.requests.length, 0)
+  h.protocol.responseCancel()
+  assert.equal(h.requests.length, 1, 'a second cancel while the cut answer still streams counts as cutting speech')
+
+  t.mock.timers.reset()
+  const sent = restartHarness(t)
+  sent.protocol.normalizeIncoming({ type: 'session.delegation.created', delegation: { id: 'del_1', response_id: 'resp_1' } })
+  sent.voiced()
+  sent.protocol.responseCancel()
+  sent.protocol.encodeOutgoing({ type: 'response.item.create', item: { type: 'message', role: 'user', content: [] } })
+  sent.backend('del_1', { type: 'response.completed', response: { id: 'resp_1', status: 'completed' } })
+  for (let i = 0; i < 50; i += 1) {
+    sent.advance(100)
+    sent.voiced()
+  }
+  assert.equal(sent.requests.length, 0, 'the new request lives on this session')
 })
 
 test('a GPT-Live 1 cancel of speech reopens the session silently, without the unanswered question', { timeout: 10000 }, async t => {
@@ -2047,4 +2101,42 @@ test('a GPT-Live 1 cancel of speech reopens the session silently, without the un
   session.cancelResponse()
   await new Promise(resolve => setTimeout(resolve, 200))
   assert.equal(connections.length, 2, 'a cancel with nothing being said does not restart')
+})
+
+test('a GPT-Live 1 request sent in the same tick as the cancel keeps the session, so the question is not lost', { timeout: 10000 }, async t => {
+  withEnv(t, { GPT_LIVE_1_RESTART_ON_CANCEL: '1', GPT_LIVE_1_DROP_CANCELLED_TAIL: '1' })
+  const speech = pcmFrame({ amplitude: 3000 })
+  const { connections } = await liveMockServer(t, (message, connection) => {
+    if (message.type === 'session.start') connection.socket.send(JSON.stringify({ type: 'session.output_audio.delta', delta: speech }))
+  })
+  const logs = []
+  const events = []
+  const session = new RealtimeProviderSession({
+    providerRegistry: { resolve: () => gptLive1Provider },
+    defaultProvider: 'gpt-live-1',
+    getAgentContext: () => ({}),
+    shouldReconnect: () => true,
+    onEvent: event => events.push(event),
+    onDiagnostic: () => {},
+    onConnected: () => {},
+    onReady: () => {},
+    onDisconnected: () => {},
+    onReconnected: () => {},
+    onConnectionState: () => {},
+    onError: () => {},
+    onReconnectError: () => {},
+    logger: { info: (name, fields) => logs.push([name, fields]), warn: () => {}, error: () => {} },
+  })
+  t.after(() => session.close())
+  await session.ensure()
+  await until(() => events.some(event => event.type === 'response.output_audio.delta'))
+  // RealtimeInputRuntime.submit order: cancel the voice, then send the text on the current frontend.
+  session.cancelResponse()
+  session.frontend.sendUserInput([{ type: 'text', text: '一加一等于几' }], {}).catch(() => {})
+  await until(() => logs.some(([name]) => name === 'realtime.restart_skipped'))
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(connections.length, 1, 'the session carrying the question is kept')
+  assert.ok(connections[0].received.some(message => message.type === 'response.create'))
+  assert.ok(!connections[0].received.some(message => message.type === 'session.close'))
+  assert.equal(logs.find(([name]) => name === 'realtime.restart_skipped')[1].reason, 'frontend_busy')
 })
