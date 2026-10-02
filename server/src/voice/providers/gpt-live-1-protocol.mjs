@@ -64,6 +64,15 @@ const VOICE_HOLD_MAX_QUIET_MS = 20000
 // no spoken onset this long after completion, the result text is handed to it
 // as commentary (measured: not spoken twice when the voice was already on it).
 export const DEFAULT_RESULT_RELAY_MS = 2000
+// Some sessions never speak at all, not even a relayed result, while the next
+// session answers the same question normally (measured: 1 session in 9 through
+// the internal gateway, idle time irrelevant). With voiceStallMs, a user turn
+// still unspoken that long after its request, its backend done for a moment,
+// asks for a fresh session that asks the turn again. The checks stop where an
+// answer from that session could no longer reach a client waiting 8 s.
+const VOICE_STALL_AFTER_BACKEND_MS = 1500
+const VOICE_STALL_GIVE_UP_MS = 2500
+const VOICE_STALL_RECHECK_MS = 250
 // With dropSpontaneousSpeech, a text-only client (no real input audio this long)
 // asks nothing between its requests: speech the voice layer starts with nothing
 // pending would reach it as a stray notification, so it is dropped.
@@ -376,6 +385,8 @@ export function createGptLive1Protocol({
   dropCancelledTail = false,
   restartOnCancel = false,
   requestRestart = null,
+  voiceStallMs = 0,
+  requestStallRestart = null,
   outputGain = 1,
   now = () => performance.now(),
 } = {}) {
@@ -426,6 +437,11 @@ export function createGptLive1Protocol({
   const relayIds = new Set()
   // A speak request acknowledged: its speech may start after the ack.
   let speakOwedUntil = 0
+  // Voice stall watch: when the open user turn was requested, when the backend
+  // last finished, and the pending check.
+  let userTurnAt = -Infinity
+  let backendDoneAt = -Infinity
+  let stallTimer = null
   // When the current or last spoken answer began on the session timeline. The
   // OpenAI primary WebSocket sends audio without timing, so this also comes
   // from output transcript deltas; NaN until either arrives.
@@ -637,6 +653,37 @@ export function createGptLive1Protocol({
     relayTimer.unref?.()
   }
 
+  const clearStall = () => {
+    clearTimeout(stallTimer)
+    stallTimer = null
+  }
+
+  const checkStall = () => {
+    stallTimer = null
+    if (lastVoicedAt >= userTurnAt) return
+    const backendBusy = awaitingBackend || backendResponses.size > 0 || pendingFunctionCalls.size > 0
+    if (backendBusy || now() - backendDoneAt < VOICE_STALL_AFTER_BACKEND_MS) {
+      if (now() - userTurnAt < voiceStallMs + VOICE_STALL_GIVE_UP_MS) {
+        stallTimer = setTimeout(checkStall, VOICE_STALL_RECHECK_MS)
+        stallTimer.unref?.()
+      }
+      return
+    }
+    if (trace) {
+      trace(traceLine('--', { type: 'gpt-live-1.voice_stalled', waited_ms: Math.round(now() - userTurnAt) }))
+    }
+    clearRelay()
+    requestStallRestart()
+  }
+
+  const armStall = () => {
+    clearStall()
+    if (!(voiceStallMs > 0) || typeof requestStallRestart !== 'function') return
+    userTurnAt = now()
+    stallTimer = setTimeout(checkStall, voiceStallMs)
+    stallTimer.unref?.()
+  }
+
   const holdVoiceSegment = () => backendResponses.size > 0
     || awaitingBackend
     || pendingFunctionCalls.size > 0
@@ -843,6 +890,7 @@ export function createGptLive1Protocol({
       case 'response.incomplete':
         delegationResponses.delete(delegationId)
         backendResponses.delete(responseId)
+        backendDoneAt = now()
         voiceOwedUntil = now() + voiceOwedMs
         // Quiet already: no spoken segment, or one in a sustained pause.
         quietSinceBackendDone = !voiceResponseId || silentRunMs >= OUTPUT_ONSET_PAUSE_MS
@@ -860,6 +908,7 @@ export function createGptLive1Protocol({
       case 'response.failed':
       case 'error':
         awaitingBackend = false
+        backendDoneAt = now()
         backendText.delete(responseId)
         delegationResponses.delete(delegationId)
         backendResponses.delete(responseId)
@@ -1090,6 +1139,7 @@ export function createGptLive1Protocol({
       case 'session.closed': {
         stopKeepalive()
         clearRelay()
+        clearStall()
         backendText.clear()
         awaitingBackend = false
         pendingFunctionCalls.clear()
@@ -1187,11 +1237,14 @@ export function createGptLive1Protocol({
         remember(sentItems, encoded.event_id, { item: encoded.item, bytes, responseCreateId: '' })
         pendingBatch.push(encoded.event_id)
       } else if (payload.type === 'response.create') {
+        let userTurn = false
         for (const itemEventId of pendingBatch) {
           const sent = sentItems.get(itemEventId)
           if (sent) sent.responseCreateId = encoded.event_id
+          if (sent?.item?.type === 'message' && sent.item.role === 'user') userTurn = true
         }
         pendingBatch = []
+        if (userTurn) armStall()
       }
       if (payload.type === 'session.input_audio.append' && !fillingSilence) lastRealAudioAt = now()
       if (fillingSilence) {
@@ -1232,6 +1285,7 @@ export function createGptLive1Protocol({
     sessionClose: () => {
       stopKeepalive()
       clearRelay()
+      clearStall()
       return { type: 'session.close' }
     },
 

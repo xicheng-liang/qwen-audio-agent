@@ -82,6 +82,8 @@ Do this in reverse order.
 ## 5. Known limits
 
 - Each colleague gets a fresh qaa: the tenant's memory and history stay on 34.212, and there is no coding-agent backend.
+- About 1 GPT-Live session in 9 never speaks, not even a relayed result, while the next session answers normally; idle time makes no difference.
+  - With `GPT_LIVE_1_VOICE_STALL_MS=4500`, which `glx.sh` sets, a typed turn that is still unspoken 4.5 s after the request, with its backend done for 1.5 s, is asked again once on a fresh session within the gateway's 8 s budget.
 - The experiment's known issues remain:
   - audio gaps mid-sentence, because the output streams at 1× real time;
   - slow delegation;

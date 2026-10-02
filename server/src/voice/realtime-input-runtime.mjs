@@ -68,6 +68,7 @@ export class RealtimeInputRuntime {
     this.onSpeechStarted = onSpeechStarted
     this.onSpeechStopped = onSpeechStopped
     this.createInputTurnId = createInputTurnId
+    this.lastSubmitted = null
   }
 
   handles(event) {
@@ -313,7 +314,26 @@ export class RealtimeInputRuntime {
       content: display,
       turnId: inputTurnId,
     })
-    this.ensureFrontend({ turnId: inputTurnId })
+    this.lastSubmitted = { parts, context: inputContext }
+    this.#ask(parts, inputContext)
+  }
+
+  // Asks the last typed turn again, once, after the provider gave up a session
+  // that never answered it. A newer turn, typed or spoken, wins.
+  replayStalledInput() {
+    const last = this.lastSubmitted
+    this.lastSubmitted = null
+    if (!last) return false
+    const current = this.turns.current()
+    if (current.turnId !== last.context.turnId
+      || current.turnGeneration !== last.context.turnGeneration) return false
+    this.#ask(last.parts, last.context)
+    return true
+  }
+
+  #ask(parts, inputContext) {
+    const { turnId } = inputContext
+    this.ensureFrontend({ turnId })
       .then(() => this.getFrontend().sendUserInput(parts, inputContext))
       .then(outcome => {
         if (!outcome?.timedOut) return
@@ -321,7 +341,7 @@ export class RealtimeInputRuntime {
         this.send({
           type: GatewayServerEvent.VOICE_STATE,
           state: 'idle',
-          turnId: inputTurnId,
+          turnId,
           origin: 'model',
         })
         this.reportFrontendError(new Error(

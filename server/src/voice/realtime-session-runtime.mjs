@@ -316,6 +316,8 @@ export function createRealtimeSessionRuntime({
           : taskCoordinator.activeTasks().length ? 'active_task'
             : announcements.isIdle?.() !== true ? 'announcement' : ''
     ),
+    // A session given up for going silent: the typed turn is asked again.
+    onStallRestarted: () => inputs.replayStalledInput(),
     ...(realtimeFrontendFactory
       ? { createFrontend: realtimeFrontendFactory }
       : {}),

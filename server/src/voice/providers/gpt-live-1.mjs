@@ -202,6 +202,13 @@ function restartOnCancel() {
   return String(process.env.GPT_LIVE_1_RESTART_ON_CANCEL || '').trim() === '1'
 }
 
+// Ask a user turn again on a fresh Live session when the voice layer has said
+// nothing this long after the request (off by default; 2000 to 6000 ms).
+function voiceStallMs() {
+  const value = Number(process.env.GPT_LIVE_1_VOICE_STALL_MS)
+  return Number.isFinite(value) && value > 0 ? Math.min(6000, Math.max(2000, Math.floor(value))) : 0
+}
+
 // Fixed gain on the voice output, 0.25 to 4 (default 1). Measured on the earbud:
 // about 6 dB below the other providers, with about 10 dB of peak headroom.
 function outputGain() {
@@ -270,6 +277,7 @@ export const gptLive1Provider = {
     dropSpontaneousSpeech: dropSpontaneousSpeech(),
     dropCancelledTail: dropCancelledTail(),
     restartOnCancel: restartOnCancel(),
+    voiceStallMs: voiceStallMs(),
     outputGain: outputGain(),
     itemMaxBytes: backendItemMaxBytes(),
     standingInstructions: STANDING_RESPONSE_INSTRUCTIONS,

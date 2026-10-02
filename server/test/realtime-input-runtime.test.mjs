@@ -194,6 +194,43 @@ test('manual text input supersedes speech and reaches the frontend once', async 
   )
 })
 
+test('a typed turn the provider gave up on is asked again once, into the same turn', async () => {
+  const { runtime, events, calls } = harness()
+  runtime.submit({ text: '你好，你是谁？' })
+  await Promise.resolve()
+  await Promise.resolve()
+  events.length = 0
+  calls.length = 0
+
+  assert.equal(runtime.replayStalledInput(), true)
+  await Promise.resolve()
+  await Promise.resolve()
+  const sent = calls.filter(([name]) => name === 'sendUserInput')
+  assert.equal(sent.length, 1)
+  assert.deepEqual(sent[0][1], [{ type: 'text', text: '你好，你是谁？' }])
+  assert.deepEqual(sent[0][2], { turnId: 'text-1', turnGeneration: 1 }, 'the answer still belongs to the turn')
+  assert.deepEqual(events, [], 'nothing new reaches the client: no second turn, caption or record')
+  assert.ok(!calls.some(([name]) => name === 'cancel'))
+
+  assert.equal(runtime.replayStalledInput(), false, 'only once')
+})
+
+test('a newer turn wins over asking a stalled one again', async () => {
+  const { runtime, turns, calls } = harness()
+  runtime.submit({ text: '上海天气怎么样' })
+  await Promise.resolve()
+  turns.finishManualResponse(turns.current())
+  runtime.handleProviderEvent({ type: 'input_audio_buffer.speech_started', item_id: 'item-voice' })
+  assert.equal(turns.current().turnId, 'voice-2', 'the user spoke since')
+  calls.length = 0
+  assert.equal(runtime.replayStalledInput(), false)
+  await Promise.resolve()
+  assert.ok(!calls.some(([name]) => name === 'sendUserInput'))
+
+  const fresh = harness()
+  assert.equal(fresh.runtime.replayStalledInput(), false, 'nothing typed, nothing to ask')
+})
+
 test('invalid manual input fails before changing the current turn', () => {
   const { runtime, turns, events } = harness()
 

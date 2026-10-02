@@ -2015,6 +2015,128 @@ test('GPT-Live 1 asks for a fresh session only once delegated work has finished'
   assert.equal(h.requests.length, 1, 'the cut answer still streaming asks once the work is done')
 })
 
+function stallHarness(t, options = {}) {
+  const stalls = []
+  let elapsed = 0
+  const h = cancelHarness(t, { voiceStallMs: 4500, requestStallRestart: () => stalls.push(elapsed), ...options })
+  const advance = ms => { elapsed += ms; h.advance(ms) }
+  const ask = (text = '你好，你是谁？') => {
+    h.protocol.encodeOutgoing({
+      type: 'response.item.create',
+      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+    })
+    h.protocol.encodeOutgoing({ type: 'response.create' })
+  }
+  const backend = (id, nested) => h.protocol.normalizeIncoming({ type: 'response.event', delegation_id: id, event: nested })
+  const answer = id => {
+    h.protocol.normalizeIncoming({ type: 'session.delegation.created', delegation: { id, response_id: `resp_${id}` } })
+    backend(id, { type: 'response.created', response: { id: `resp_${id}` } })
+    return () => backend(id, { type: 'response.completed', response: { id: `resp_${id}`, status: 'completed' } })
+  }
+  return { ...h, advance, stalls, ask, answer }
+}
+
+test('GPT-Live 1 takes the voice stall watch from the environment and hands the request to its session', async t => {
+  const run = env => {
+    withEnv(t, { GPT_LIVE_1_VOICE_STALL_MS: env })
+    const stalls = []
+    const frontend = new RealtimeFrontend({
+      provider: gptLive1Provider, agentContext: {}, onStallRestartRequested: () => stalls.push(1),
+    })
+    t.after(() => frontend.close())
+    const p = frontend.protocol
+    p.normalizeIncoming({ type: 'session.started', session: { id: 's' } })
+    p.encodeOutgoing({
+      type: 'response.item.create',
+      item: { type: 'message', role: 'user', content: [{ type: 'input_text', text: '你好' }] },
+    })
+    p.encodeOutgoing({ type: 'response.create' })
+    p.normalizeIncoming({ type: 'session.delegation.created', delegation: { id: 'del_1', response_id: 'resp_1' } })
+    for (const type of ['response.created', 'response.completed']) {
+      p.normalizeIncoming({
+        type: 'response.event', delegation_id: 'del_1',
+        event: { type, response: { id: 'resp_1', status: 'completed' } },
+      })
+    }
+    return stalls
+  }
+  const on = run('2000')
+  const off = run(undefined)
+  await new Promise(resolve => setTimeout(resolve, 2300))
+  assert.deepEqual(on, [1], 'GPT_LIVE_1_VOICE_STALL_MS=2000 asks after 2 s')
+  assert.deepEqual(off, [], 'unset: off')
+})
+
+test('GPT-Live 1 asks for a fresh session when a user turn is never spoken', t => {
+  const h = stallHarness(t)
+  h.ask()
+  const done = h.answer('del_1')
+  h.advance(2000)
+  done()
+  h.advance(2400)
+  assert.deepEqual(h.stalls, [], 'not before the stall time')
+  h.advance(100)
+  assert.deepEqual(h.stalls, [4500], 'asked once the turn went unspoken for 4.5 s')
+  h.advance(5000)
+  assert.equal(h.stalls.length, 1, 'once per turn')
+})
+
+test('GPT-Live 1 leaves a turn alone once the voice speaks, and is off by default', t => {
+  const spoken = stallHarness(t)
+  spoken.ask()
+  const done = spoken.answer('del_1')
+  spoken.advance(3000)
+  spoken.voiced()
+  done()
+  spoken.advance(6000)
+  assert.deepEqual(spoken.stalls, [])
+
+  t.mock.timers.reset()
+  const off = stallHarness(t, { voiceStallMs: 0 })
+  off.ask()
+  off.answer('del_1')()
+  off.advance(10000)
+  assert.deepEqual(off.stalls, [])
+
+  t.mock.timers.reset()
+  const tool = stallHarness(t)
+  tool.protocol.encodeOutgoing({
+    type: 'response.item.create', item: { type: 'function_call_output', call_id: 'c1', output: '{}' },
+  })
+  tool.protocol.encodeOutgoing({ type: 'response.create' })
+  tool.advance(10000)
+  assert.deepEqual(tool.stalls, [], 'a tool result is not a user turn')
+})
+
+test('GPT-Live 1 waits for the backend before calling a turn silent, within the client budget', t => {
+  const slow = stallHarness(t)
+  slow.ask()
+  const done = slow.answer('del_1')
+  slow.advance(4000)
+  done()
+  slow.advance(1400)
+  assert.deepEqual(slow.stalls, [], 'the voice gets a moment after the result')
+  for (let i = 0; i < 6 && !slow.stalls.length; i += 1) slow.advance(100)
+  assert.equal(slow.stalls.length, 1)
+  assert.ok(slow.stalls[0] >= 5500 && slow.stalls[0] <= 5800, 'asked 1.5 to 1.8 s after the result')
+
+  t.mock.timers.reset()
+  const busy = stallHarness(t)
+  busy.ask()
+  busy.answer('del_1')
+  busy.advance(20000)
+  assert.deepEqual(busy.stalls, [], 'too late for a fresh session to help: left to the backend')
+})
+
+test('GPT-Live 1 drops the stall watch when the session closes', t => {
+  const h = stallHarness(t)
+  h.ask()
+  h.answer('del_1')()
+  h.protocol.sessionClose()
+  h.advance(10000)
+  assert.deepEqual(h.stalls, [])
+})
+
 test('GPT-Live 1 treats a cut answer still streaming as speech, and a new request disarms the restart', t => {
   const h = restartHarness(t)
   h.voiced()

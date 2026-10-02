@@ -41,6 +41,9 @@ export class RealtimeProviderSession {
     idleCloseBlocker = () => 'disabled',
     // The same for a restart after cancel, which happens mid-conversation.
     restartBlocker = () => '',
+    // Called once a session that went silent on a user turn was given up, so
+    // the turn can be asked again; that request wakes a fresh session.
+    onStallRestarted = null,
     now = () => performance.now(),
   }) {
     this.providerRegistry = providerRegistry
@@ -73,6 +76,7 @@ export class RealtimeProviderSession {
     this.inputMuted = false
     this.idleCloseBlocker = idleCloseBlocker
     this.restartBlocker = restartBlocker
+    this.onStallRestarted = onStallRestarted
     this.now = now
     // Parked: the provider session was closed while idle and reopens on the
     // next request, with no connection state change reported to the client.
@@ -231,6 +235,7 @@ export class RealtimeProviderSession {
       onError: error => this.#handleProviderError(createdFrontend, error),
       onClose: () => this.#handleClose(createdFrontend),
       onRestartRequested: () => this.#restartAfterCancel(createdFrontend),
+      onStallRestartRequested: () => this.#restartAfterStall(createdFrontend),
     })
     this.frontend = createdFrontend
     let createdConnectPromise
@@ -489,6 +494,42 @@ export class RealtimeProviderSession {
         provider: frontend.provider.key,
         error,
       }))
+    }, 0)
+    timer.unref?.()
+  }
+
+  // Gives up a session whose voice layer went silent on a user turn: it parks as
+  // an idle session does, and the turn asked again wakes a fresh one. Work above
+  // the provider that a new session would not know about keeps the old session.
+  #restartAfterStall(frontend) {
+    const timer = setTimeout(() => {
+      if (this.frontend !== frontend || !frontend.ready || this.connectPromise
+        || this.scheduledReconnect || this.blockedError) return
+      let blocker = ''
+      try {
+        blocker = String(this.restartBlocker() || '')
+      } catch {
+        blocker = 'blocker_threw'
+      }
+      if (blocker) {
+        this.logger.info('realtime.restart_skipped', {
+          provider: frontend.provider.key, reason: blocker, cause: 'voice_stall',
+        })
+        return
+      }
+      this.logger.info('realtime.restarted_after_stall', {
+        provider: frontend.provider.key,
+        connectedMs: this.connectedAt ? Date.now() - this.connectedAt : 0,
+      })
+      this.detach({ clearAudio: false })
+      this.connectedAt = 0
+      this.idleBlocker = ''
+      this.parked = true
+      try {
+        this.onStallRestarted?.()
+      } catch (error) {
+        this.logger.warn('realtime.stall_replay_failed', { provider: frontend.provider.key, error })
+      }
     }, 0)
     timer.unref?.()
   }

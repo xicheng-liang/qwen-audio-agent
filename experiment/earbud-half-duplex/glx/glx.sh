@@ -20,7 +20,8 @@ ENTRY=qaa-glx-entry
 DOORMAN=qaa-glx-doorman
 ENTRY_URL=http://10.0.2.151:80
 TUNING=(GPT_LIVE_1_IDLE_CLOSE_MS=30000 GPT_LIVE_1_DROP_SPONTANEOUS_SPEECH=1
-        GPT_LIVE_1_DROP_CANCELLED_TAIL=1 GPT_LIVE_1_OUTPUT_GAIN=2 GPT_LIVE_1_RESTART_ON_CANCEL=1)
+        GPT_LIVE_1_DROP_CANCELLED_TAIL=1 GPT_LIVE_1_OUTPUT_GAIN=2 GPT_LIVE_1_RESTART_ON_CANCEL=1
+        GPT_LIVE_1_VOICE_STALL_MS=4500)
 
 tenant_arg() {
   [[ ${1:-} =~ ^[0-9a-f]{12}$ ]] || { echo "tenant must be 12 hex"; exit 1; }
@@ -28,7 +29,7 @@ tenant_arg() {
 
 seed_env() {
   # The trial column's keys, minus its port, plus the earbud tuning the exp column runs with.
-  local drop='^(PORT|GPT_LIVE_1_IDLE_CLOSE_MS|GPT_LIVE_1_DROP_SPONTANEOUS_SPEECH|GPT_LIVE_1_DROP_CANCELLED_TAIL|GPT_LIVE_1_OUTPUT_GAIN|GPT_LIVE_1_RESTART_ON_CANCEL)='
+  local drop='^(PORT|GPT_LIVE_1_IDLE_CLOSE_MS|GPT_LIVE_1_DROP_SPONTANEOUS_SPEECH|GPT_LIVE_1_DROP_CANCELLED_TAIL|GPT_LIVE_1_OUTPUT_GAIN|GPT_LIVE_1_RESTART_ON_CANCEL|GPT_LIVE_1_VOICE_STALL_MS)='
   (umask 077; grep -v -E "$drop" /srv/qaa-trial/trial.env > glx.env; printf '%s\n' "${TUNING[@]}" >> glx.env)
   grep -q '^HOST=127.0.0.1$' glx.env || { rm -f glx.env; echo "trial.env must hold HOST=127.0.0.1"; exit 1; }
   grep -q '^QWEN_AUDIO_REALTIME_PROVIDER=gpt-live-1$' glx.env \

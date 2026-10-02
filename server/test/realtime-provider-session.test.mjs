@@ -599,3 +599,46 @@ test('a restart after cancel reopens silently, and a failed reopen keeps the see
   assert.deepEqual(calls.filter(call => call[0] === 'onReady').map(call => call[1]),
     [{ resumedFromPark: false }, { resumedFromPark: true }])
 })
+
+test('a session gone silent on a turn is parked and the turn handed back to be asked again', async () => {
+  const replays = []
+  const { runtime, calls, frontends } = harness({
+    connectMode: 'resolve', restartBlocker: () => '', onStallRestarted: () => replays.push(runtime.parked),
+  })
+  await runtime.ensure()
+  const statesBefore = calls.filter(call => call[0] === 'state').length
+  frontends[0].options.onStallRestartRequested()
+  await new Promise(resolve => setTimeout(resolve, 5))
+  assert.ok(calls.some(call => call[0] === 'close'), 'the silent session is closed')
+  assert.equal(frontends.length, 1, 'nothing reopens until the turn is asked again')
+  assert.deepEqual(replays, [true], 'handed back once, parked, so the replay wakes a fresh session')
+  assert.ok(calls.some(call => call[0] === 'log.info' && call[1] === 'realtime.restarted_after_stall'))
+  await runtime.ensure()
+  assert.equal(frontends.length, 2)
+  assert.equal(frontends[1].options.sessionOptions.trimTrailingUser, undefined, 'the wake seeds as usual')
+  assert.equal(calls.filter(call => call[0] === 'state').length, statesBefore, 'no connection state reached the client')
+  runtime.close()
+})
+
+test('a silent session is kept while work above the provider would be lost, and a stale request is ignored', async () => {
+  const replays = []
+  const blocked = harness({
+    connectMode: 'resolve', restartBlocker: () => 'tool_call', onStallRestarted: () => replays.push('blocked'),
+  })
+  await blocked.runtime.ensure()
+  blocked.frontends[0].options.onStallRestartRequested()
+  await new Promise(resolve => setTimeout(resolve, 5))
+  assert.ok(!blocked.calls.some(call => call[0] === 'close'))
+  assert.ok(blocked.calls.some(call => call[0] === 'log.info' && call[1] === 'realtime.restart_skipped'
+    && call[2].reason === 'tool_call' && call[2].cause === 'voice_stall'))
+
+  const stale = harness({ connectMode: 'resolve', onStallRestarted: () => replays.push('stale') })
+  await stale.runtime.ensure()
+  const old = stale.frontends[0]
+  old.triggerClose()
+  old.options.onStallRestartRequested()
+  await new Promise(resolve => setTimeout(resolve, 5))
+  assert.deepEqual(replays, [], 'neither hands a turn back')
+  blocked.runtime.close()
+  stale.runtime.close()
+})

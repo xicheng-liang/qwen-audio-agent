@@ -131,6 +131,7 @@ export class RealtimeFrontend {
     onDiagnostic,
     onResponseSettled,
     onRestartRequested,
+    onStallRestartRequested,
     agentContext = {},
     sessionOptions = {},
     responseStartTimeoutMs,
@@ -156,6 +157,9 @@ export class RealtimeFrontend {
         requestRestart: () => {
           if (this.restartSafe()) this.onRestartRequested?.()
         },
+        // A protocol whose voice layer went silent on a user turn asks for a
+        // fresh session that asks the turn again; this session is given up.
+        requestStallRestart: () => this.onStallRestartRequested?.(),
       }) ?? provider.protocol,
       provider.key || provider.label,
     )
@@ -169,6 +173,7 @@ export class RealtimeFrontend {
     this.onDiagnostic = onDiagnostic
     this.onResponseSettled = onResponseSettled
     this.onRestartRequested = onRestartRequested
+    this.onStallRestartRequested = onStallRestartRequested
     this.agentContext = agentContext
     this.sessionOptions = sessionOptions
     this.ws = null
