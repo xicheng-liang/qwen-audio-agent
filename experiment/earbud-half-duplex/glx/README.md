@@ -14,7 +14,7 @@ earbud ──► 34.212 device gateway ──/resolve──► allocator (branch
       EC2 qaa-glx-entry (nginx :80) ◄───────────────┘
                  │ auth_request
                  ▼
-      qaa-glx-doorman (127.0.0.1:4299) ──docker──► qaa-glx-<tenant> (qaa:gpt-live-1-exp, :3130-3159)
+      qaa-glx-doorman (127.0.0.1:4299) ──docker──► qaa-glx-<tenant> (qaa:gpt-live-1-exp, :3130-3164)
 ```
 
 - **Allocator.** The allocator answers `/resolve` with the EC2 URL for a tenant whose *running container* was built on a route carrying `SIGMA_ROUTE_HOST`.
@@ -24,7 +24,7 @@ earbud ──► 34.212 device gateway ──/resolve──► allocator (branch
 - **Allocator switches.**
   - Mid-switch, the running container's route label decides the answer. Outside a switch, the tenant's row decides.
   - The drop is tried up to three times, goes out before the switch commits, and is also sent when a switch is settled after an allocator restart and when a tenant is removed.
-- **Doorman.** It starts one container per tenant on first use, allows at most 30 at a time (ports 3130–3159), and removes a container after 30 minutes with no connection.
+- **Doorman.** It starts one container per tenant on first use, allows at most 35 at a time (ports 3130–3164), and removes a container after 30 minutes with no connection.
   - "Full" answers 503, never 401 or 403, which the gateway would read as its own identity being refused.
   - It answers only requests that carry the entry's key.
 - **Tenant containers.** They run on the docker bridge, published on 127.0.0.1 only, and each has its own access token. qaa therefore sees a non-loopback peer and enforces the token, so other processes on the box cannot reach a tenant's session.
