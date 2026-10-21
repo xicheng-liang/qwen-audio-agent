@@ -5,10 +5,16 @@ tenant's socket and forwards /warm and /drop to it.
 
 Tenant containers run on the docker bridge, published on 127.0.0.1 only, each with its own access
 token: qaa then sees a non-loopback peer and enforces that token, so another process on this box
-cannot talk to a tenant's session."""
+cannot talk to a tenant's session.
+
+Backend line (on when conf/relay-shim.secret exists): each container's ACP slot runs the Sigma shim
+with the env the 34.212 allocator gives a tenant, so tasks reach the runner on the user's own machine.
+The 34.212 relay's shim port arrives on this box's loopback through a reverse ssh tunnel; this
+process forwards it from the docker bridge gateway, where the containers can reach it."""
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import hmac
 import http.client
 import http.server
@@ -45,6 +51,16 @@ ACTION_RE = re.compile(r"^/(warm|drop)/([0-9a-f]{12})$")
 # glx.env keys every tenant gets its own value for
 PER_TENANT = ("PORT", "HOST", "QWEN_AUDIO_GATEWAY_ACCESS_TOKEN")
 TCP_ESTABLISHED, TCP_LISTEN = "01", "0A"
+# backend line: shim files copied from a 34.212 tenant container, the relay reached via the tunnel
+SHIM_SECRET_FILE = f"{ROOT}/conf/relay-shim.secret"
+SHIM_DIR = f"{HOST_ROOT}/sigma"
+# 19801, not 9801: a dev identity mock already holds 127.0.0.1:9801 on this box
+RELAY_FWD_LISTEN = (os.environ.get("GLX_RELAY_FWD_HOST", "172.17.0.1"), 19801)
+RELAY_FWD_TARGET = ("127.0.0.1", 19801)
+SHIM_FORWARD_ENV = "SIGMA_RELAY_URL,SIGMA_TENANT_ID,SIGMA_TENANT_PROOF,SIGMA_SHIM_READY_TIMEOUT_MS"
+BACKEND_KEYS = ("AGENT_PROTOCOL", "ACP_COMMAND", "ACP_ARGS", "ACP_LABEL", "CLAUDE_CODE_EXECUTABLE",
+                "SIGMA_RELAY_URL", "SIGMA_TENANT_ID", "SIGMA_TENANT_PROOF",
+                "QWEN_AUDIO_AGENT_ACP_FORWARD_ENV")
 
 
 def log(event: str, **fields: object) -> None:
@@ -116,19 +132,70 @@ def healthy(port: int, token: str, deadline: float) -> bool:
     return False
 
 
-def tenant_env(token: str) -> list[str]:
+def shim_secret() -> str:
+    try:
+        with open(SHIM_SECRET_FILE, encoding="utf-8") as fh:
+            return fh.read().strip()
+    except OSError:
+        return ""
+
+
+def backend_env(tenant: str, secret: str) -> list[str]:
+    """allocator runtime.backend_env: shim → relay → the runner this tenant's account holds."""
+    proof = hmac.new(secret.encode(), tenant.encode(), hashlib.sha256).hexdigest()
+    return ["AGENT_PROTOCOL=acp", "ACP_COMMAND=node",
+            'ACP_ARGS=["/opt/sigma/sigma-shim/shim.mjs"]', "ACP_LABEL=OpenAgent",
+            f"SIGMA_RELAY_URL=ws://{RELAY_FWD_LISTEN[0]}:{RELAY_FWD_LISTEN[1]}",
+            f"SIGMA_TENANT_ID={tenant}", f"SIGMA_TENANT_PROOF={proof}",
+            f"QWEN_AUDIO_AGENT_ACP_FORWARD_ENV={SHIM_FORWARD_ENV}"]
+
+
+def tenant_env(tenant: str, token: str, secret: str) -> list[str]:
     """glx.env as docker --env-file reads it (KEY=VALUE, literal), with this tenant's own values."""
+    skip = PER_TENANT + (BACKEND_KEYS if secret else ())
     env: list[str] = []
     with open(f"{ROOT}/glx.env", encoding="utf-8") as fh:
         for line in fh:
             line = line.rstrip("\r\n")
             if not line or line.lstrip().startswith("#") or "=" not in line:
                 continue
-            if line.split("=", 1)[0].strip() in PER_TENANT:
+            if line.split("=", 1)[0].strip() in skip:
                 continue
             env.append(line)
-    return env + ["HOST=0.0.0.0", f"PORT={CONTAINER_PORT}",
-                  f"QWEN_AUDIO_GATEWAY_ACCESS_TOKEN={token}"]
+    env += ["HOST=0.0.0.0", f"PORT={CONTAINER_PORT}", f"QWEN_AUDIO_GATEWAY_ACCESS_TOKEN={token}"]
+    return env + (backend_env(tenant, secret) if secret else [])
+
+
+def _pipe(src: socket.socket, dst: socket.socket) -> None:
+    with contextlib.suppress(OSError):
+        while chunk := src.recv(65536):
+            dst.sendall(chunk)
+    for s in (src, dst):
+        with contextlib.suppress(OSError):
+            s.shutdown(socket.SHUT_RDWR)
+
+
+def relay_forward_forever() -> None:
+    """Docker bridge gateway → loopback end of the reverse tunnel to the 34.212 relay's shim port."""
+    while True:
+        try:
+            server = socket.create_server(RELAY_FWD_LISTEN)
+            break
+        except OSError as exc:                            # bridge not up yet after a reboot
+            log("relay_fwd.retry", error=str(exc)[:120])
+            time.sleep(5)
+    log("relay_fwd.ready", listen=f"{RELAY_FWD_LISTEN[0]}:{RELAY_FWD_LISTEN[1]}")
+    while True:
+        client, _ = server.accept()
+        try:
+            upstream = socket.create_connection(RELAY_FWD_TARGET, timeout=5)
+            upstream.settimeout(None)
+        except OSError as exc:
+            log("relay_fwd.no_tunnel", error=str(exc)[:120])
+            client.close()
+            continue
+        for a, b in ((client, upstream), (upstream, client)):
+            threading.Thread(target=_pipe, args=(a, b), daemon=True).start()
 
 
 def read_token(tenant: str) -> str:
@@ -169,15 +236,20 @@ class Doorman:
         with os.fdopen(fd, "w", encoding="ascii") as fh:
             fh.write(token)
         exposed = f"{CONTAINER_PORT}/tcp"
+        secret = shim_secret()
+        binds = [f"{HOST_ROOT}/data/{tenant}:/data"]
+        if secret:
+            binds += [f"{SHIM_DIR}/sigma-shim:/opt/sigma/sigma-shim:ro",
+                      f"{SHIM_DIR}/sigma-runner:/opt/sigma/sigma-runner:ro"]
         spec = {
             "Image": IMAGE,
-            "Env": tenant_env(token),
+            "Env": tenant_env(tenant, token, secret),
             "ExposedPorts": {exposed: {}},
             "Labels": {"trial.owner": "xicheng", "trial.purpose": "glx-tenant",
                        LABEL: tenant, "glx.port": str(port)},
             "HostConfig": {"PortBindings": {exposed: [{"HostIp": "127.0.0.1",
                                                        "HostPort": str(port)}]},
-                           "Binds": [f"{HOST_ROOT}/data/{tenant}:/data"],
+                           "Binds": binds,
                            "RestartPolicy": {"Name": "unless-stopped"},
                            "Memory": MEMORY_BYTES},
         }
@@ -351,10 +423,12 @@ def sweep_forever() -> None:
 def main() -> None:
     os.makedirs(TOKENS, mode=0o700, exist_ok=True)
     threading.Thread(target=sweep_forever, name="sweep", daemon=True).start()
+    if shim_secret():
+        threading.Thread(target=relay_forward_forever, name="relay-fwd", daemon=True).start()
     server = http.server.ThreadingHTTPServer(LISTEN, Handler)
     server.daemon_threads = True
     log("doorman.ready", listen=f"{LISTEN[0]}:{LISTEN[1]}", image=IMAGE, max=MAX_TENANTS,
-        idle_s=IDLE_S, ports=f"{PORT_LO}-{PORT_HI}", keyed=bool(KEY))
+        idle_s=IDLE_S, ports=f"{PORT_LO}-{PORT_HI}", keyed=bool(KEY), backend=bool(shim_secret()))
     server.serve_forever()
 
 

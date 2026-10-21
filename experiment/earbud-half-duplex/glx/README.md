@@ -92,3 +92,17 @@ Do this in reverse order.
 - The 34.212 → EC2 hop is plain ws/http inside the VPC, the same scheme and port as the local tenant path, so the gateway marker crosses the VPC unencrypted.
 - Whoever holds the allocator admin key decides where `SIGMA_ROUTE_HOST` points, and the allocator sends the gateway marker there. That key already controls every route's env.
 - A device that reconnects in the few seconds while its tenant is switching onto `gpt_live`, and uses a gateway cache entry from before the switch, may stay on the local container until its next reconnect.
+
+## Backend line (shim → 34.212 relay)
+
+On when `conf/relay-shim.secret` exists (the 34.212 relay's `SIGMA_RELAY_SHIM_SECRET`, 600). Each tenant
+container then gets the allocator's backend env (`AGENT_PROTOCOL=acp`, shim, tenant proof) and the shim
+files under `sigma/` (copied from a 34.212 tenant container), so tasks reach the user's own runner.
+
+- 34.212: container `glx-relay-tunnel` (`relay-tunnel-34212.sh`) reverse-forwards `sigma-link-relay:9801`
+  to EC2 `127.0.0.1:19801` with a key in `/srv/glx-relay-tunnel` (EC2 authorized_keys: that one listen, no shell).
+- EC2: the doorman forwards `172.17.0.1:19801` → `127.0.0.1:19801`. 9801 is taken by a dev identity mock.
+- Check: `shim-probe.sh <unbound tenant>` → relay parks the shim and answers initialize.
+- Off: `rm conf/relay-shim.secret` + `docker restart qaa-glx-doorman`. Remove fully: on 34.212
+  `docker rm -f glx-relay-tunnel; docker rmi glx-relay-tunnel:1; sudo rm -rf /srv/glx-relay-tunnel`; on EC2 drop
+  the `glx-relay-tunnel` line from `~/.ssh/authorized_keys`, `rm -rf sigma`, restore `doorman.py.bak-pre-backend-*`.
