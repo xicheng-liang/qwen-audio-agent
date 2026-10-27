@@ -68,8 +68,8 @@ function waitPolicy() {
     return ['Do not guess the result while waiting; say briefly that you are checking.']
   }
   return [
-    'Do not guess the result while waiting. If you must fill a pause, say only a',
-    'short neutral phrase such as "One moment." Never say what you are checking.',
+    'Do not guess the result while waiting. If you must fill a pause, use only a',
+    'few neutral words. Never say what you are checking.',
     'When you speak a backend result, start with the result itself, with no lead-in.',
   ]
 }
@@ -152,8 +152,19 @@ function delegationInstructions(agentContext) {
       'Return the relevant facts, the task status and the next step, concisely,',
       'for the voice layer to speak. Report an action as complete only after the',
       'tool confirms it. If the outcome is unclear, say so and what to check.',
+      ...(matchLanguage() ? [
+        'Write the reply in the language of the user\'s latest spoken message,',
+        'even when the tool results or these instructions are in another language.',
+      ] : []),
     ]),
   ].join('\n')
+}
+
+// GPT_LIVE_1_MATCH_LANGUAGE (off by default): the backend wrote its replies in
+// the language of its (Chinese) instructions, so English questions got Chinese
+// answers on the earbud.
+function matchLanguage() {
+  return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_MATCH_LANGUAGE || '').trim())
 }
 
 // Startup history for session.input (text only). The Live API accepts up to

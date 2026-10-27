@@ -11,6 +11,12 @@ const CANCEL_RECEIPT_INSTRUCTIONS = [
 
 const STATUS_RESULT_MESSAGE = '请根据这次查询结果自然回答用户；不要再次调用状态工具，不要展示 task_id。'
 
+// GPT_LIVE_1_PENDING_RECEIPT (off by default): GPT-Live's delegated backend
+// read "已受理" as done and told the earbud user the file was already created.
+function pendingReceipt() {
+  return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_PENDING_RECEIPT || '').trim())
+}
+
 function objectiveFingerprint(objective) {
   return createHash('sha256')
     .update(String(objective || '').replace(/\s+/g, ' ').trim())
@@ -426,7 +432,9 @@ export class AgentTaskRuntime {
           : {
               status: 'accepted',
               task_id: task.id,
-              message: '工作已受理，请自然确认一次，不要再次调用工具。',
+              message: pendingReceipt()
+                ? '工作已交给后台，正在进行，尚未完成。只简短说一次已经交给后台，不要说已经完成或已经处理好，也不要再次调用工具。'
+                : '工作已受理，请自然确认一次，不要再次调用工具。',
             },
         turnId,
         task.id,

@@ -916,6 +916,28 @@ test('suppresses the receipt reply when the original response already spoke', as
   await waitForTask(kit.manager, kit.outputs[0][1].task_id)
 })
 
+test('GPT_LIVE_1_PENDING_RECEIPT says the work is still running, not done', async t => {
+  const before = process.env.GPT_LIVE_1_PENDING_RECEIPT
+  process.env.GPT_LIVE_1_PENDING_RECEIPT = 'on'
+  t.after(() => {
+    if (before === undefined) delete process.env.GPT_LIVE_1_PENDING_RECEIPT
+    else process.env.GPT_LIVE_1_PENDING_RECEIPT = before
+  })
+  const kit = harness()
+  kit.transcripts.record('turn-one', '在桌面建一个文件')
+  await kit.handler.handle({
+    call_id: 'call-pending-receipt',
+    response_id: 'response-pending-receipt',
+    name: 'spawn_thinking',
+    arguments: '{"objective":"在桌面建一个文件"}',
+  }, { turnId: 'turn-one', turnGeneration: 1, responseId: 'response-pending-receipt' })
+
+  assert.equal(kit.outputs[0][1].status, 'accepted')
+  assert.match(kit.outputs[0][1].message, /尚未完成/)
+  assert.match(kit.outputs[0][1].message, /不要说已经完成/)
+  await waitForTask(kit.manager, kit.outputs[0][1].task_id)
+})
+
 test('accepts distinct spawn_thinking calls from one realtime response', async () => {
   const kit = harness()
   kit.transcripts.record('turn-one', '查询内存并生成小狗图片')

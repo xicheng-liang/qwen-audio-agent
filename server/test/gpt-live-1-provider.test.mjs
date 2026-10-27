@@ -113,6 +113,17 @@ test('GPT_LIVE_1_QUIET_WAIT swaps the "say you are checking" line for a neutral,
   assert.match(quiet, /start with the result itself/)
 })
 
+test('GPT_LIVE_1_MATCH_LANGUAGE asks the backend to reply in the user\'s language', t => {
+  withConfig(t, { gptLive1ApiKey: 'k', gptLive1Model: 'gpt-live-1', gptLive1Voice: '' })
+  withEnv(t, { GPT_LIVE_1_DELEGATION_INSTRUCTIONS: undefined, GPT_LIVE_1_MATCH_LANGUAGE: undefined })
+  const plain = gptLive1Provider.buildSession({ agentContext: {}, sessionOptions: {} })
+  assert.doesNotMatch(plain.delegation.responses.instructions, /latest spoken message/)
+
+  withEnv(t, { GPT_LIVE_1_MATCH_LANGUAGE: 'on' })
+  const matched = gptLive1Provider.buildSession({ agentContext: {}, sessionOptions: {} })
+  assert.match(matched.delegation.responses.instructions, /language of the user's latest spoken message/)
+})
+
 test('GPT-Live 1 builds a strict session.start payload with Responses delegation', t => {
   withConfig(t, { gptLive1ApiKey: 'k', gptLive1Model: 'gpt-live-1', gptLive1Voice: '' })
   withEnv(t, {
