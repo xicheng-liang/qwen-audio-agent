@@ -17,6 +17,13 @@ function pendingReceipt() {
   return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_PENDING_RECEIPT || '').trim())
 }
 
+// GPT_LIVE_1_REJECT_REDO (off by default): an earbud user correcting the
+// request at the permission prompt ("not empty, write 你好 in it") was taken as
+// a plain no, and the reject reply forbade any tool call, so nothing was redone.
+function rejectRedo() {
+  return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_REJECT_REDO || '').trim())
+}
+
 function objectiveFingerprint(objective) {
   return createHash('sha256')
     .update(String(objective || '').replace(/\s+/g, ' ').trim())
@@ -467,11 +474,17 @@ export class AgentTaskRuntime {
     const response = PERMISSION_DECISIONS.includes(decision)
       ? {
           instructions: decision === 'reject'
-            ? [
-                '权限决定已提交。',
-                '只用一句简短自然口语确认“已拒绝，后台不会执行这项操作”。',
-                '不要重述操作，不要再次询问或调用工具。',
-              ].join(' ')
+            ? (rejectRedo()
+              ? [
+                  '权限决定已提交，后台不会执行这项操作。',
+                  '若用户这句话同时说了修改后的要求（是纠正，而不只是拒绝），先用一句话确认会按新的要求重做，再按修改后的完整要求调用一次 spawn_thinking。',
+                  '若只是拒绝，只用一句简短自然口语确认“已拒绝，后台不会执行这项操作”，不要重述操作，不要再次询问或调用工具。',
+                ].join(' ')
+              : [
+                  '权限决定已提交。',
+                  '只用一句简短自然口语确认“已拒绝，后台不会执行这项操作”。',
+                  '不要重述操作，不要再次询问或调用工具。',
+                ].join(' '))
             : decision === 'always'
               ? [
                 '权限决定已提交，并在本会话立即生效。',

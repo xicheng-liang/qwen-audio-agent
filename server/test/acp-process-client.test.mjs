@@ -609,6 +609,53 @@ test('a prompt that ends on a tool call keeps the last text it said', async () =
   assert.equal(result.content, 'Done.')
 })
 
+function declineHarness(t, { knob, choose }) {
+  const before = process.env.GPT_LIVE_1_DECLINE_ENDS_TASK
+  if (knob === undefined) delete process.env.GPT_LIVE_1_DECLINE_ENDS_TASK
+  else process.env.GPT_LIVE_1_DECLINE_ENDS_TASK = knob
+  t.after(() => {
+    if (before === undefined) delete process.env.GPT_LIVE_1_DECLINE_ENDS_TASK
+    else process.env.GPT_LIVE_1_DECLINE_ENDS_TASK = before
+  })
+  const client = new AcpProcessClient({
+    label: 'Test Agent',
+    command: 'unused',
+    onPermission: async () => ({ outcome: { outcome: 'selected', optionId: choose } }),
+  })
+  client.start = async () => {}
+  client.context = {
+    async request() {
+      await client.handlePermission({
+        sessionId: 'session-decline',
+        options: [
+          { optionId: 'allow', kind: 'allow_once' },
+          { optionId: 'reject', kind: 'reject_once' },
+        ],
+      })
+      throw new Error('Internal error: [ede_diagnostic] result_type=user last_content_type=n/a stop_reason=tool_use')
+    },
+    async notify() {},
+  }
+  return client
+}
+
+test('GPT_LIVE_1_DECLINE_ENDS_TASK turns the failure after a declined permission into a result', async t => {
+  const client = declineHarness(t, { knob: 'on', choose: 'reject' })
+  const result = await client.prompt('session-decline', 'delete the file')
+  assert.equal(result.content, '用户拒绝了这项操作，后台没有执行。')
+  assert.equal(result.response.stopReason, 'end_turn')
+})
+
+test('a declined permission still fails the prompt when GPT_LIVE_1_DECLINE_ENDS_TASK is off', async t => {
+  const client = declineHarness(t, { knob: undefined, choose: 'reject' })
+  await assert.rejects(client.prompt('session-decline', 'delete the file'), /ede_diagnostic/)
+})
+
+test('an approved permission followed by a failure is still a failure', async t => {
+  const client = declineHarness(t, { knob: 'on', choose: 'allow' })
+  await assert.rejects(client.prompt('session-decline', 'delete the file'), /ede_diagnostic/)
+})
+
 test('returns ACP stop reasons without interpreting Gateway task state', async () => {
   const client = new AcpProcessClient({ label: 'Test Agent', command: 'unused' })
   client.start = async () => {}

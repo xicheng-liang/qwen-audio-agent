@@ -2076,6 +2076,29 @@ test('confirms a rejected realtime permission exactly once', async () => {
   await kit.finish()
 })
 
+test('GPT_LIVE_1_REJECT_REDO lets a correction at the permission prompt be redone', async t => {
+  const before = process.env.GPT_LIVE_1_REJECT_REDO
+  process.env.GPT_LIVE_1_REJECT_REDO = 'on'
+  t.after(() => {
+    if (before === undefined) delete process.env.GPT_LIVE_1_REJECT_REDO
+    else process.env.GPT_LIVE_1_REJECT_REDO = before
+  })
+  const kit = await permissionHarness({
+    answer: '不是空文件，里面要写你好',
+    respondPermission: async id => ({ id, taskId: 'work-one', status: 'rejected' }),
+  })
+  await kit.handler.handle({
+    call_id: 'permission-correction',
+    name: 'respond_permission',
+    arguments: JSON.stringify({ permission_id: 'auth-one', decision: 'reject' }),
+  })
+
+  const instructions = kit.outputs.at(-1)[3].response.instructions
+  assert.match(instructions, /修改后的完整要求调用一次 spawn_thinking/)
+  assert.match(instructions, /若只是拒绝/)
+  await kit.finish()
+})
+
 test('rolls back the session policy when the permission delivery fails', async () => {
   const failures = []
   const permissionPolicy = new PermissionPolicy()

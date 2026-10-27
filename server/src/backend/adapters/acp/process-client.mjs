@@ -64,6 +64,26 @@ function requestErrorMessage(error, formatRequestError) {
 
 const TOOL_UPDATES = new Set(['tool_call', 'tool_call_update'])
 
+// GPT_LIVE_1_DECLINE_ENDS_TASK (off by default): Claude Code's ACP adapter
+// answers a rejected permission by failing the prompt ("Internal error:
+// [ede_diagnostic] ... stop_reason=tool_use"), so the user's "no" became a
+// failed task. On, a prompt that fails after the user declined ends as a
+// result saying the operation was not run.
+const DECLINED_RESULT = '用户拒绝了这项操作，后台没有执行。'
+
+function declineEndsTask() {
+  return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_DECLINE_ENDS_TASK || '').trim())
+}
+
+function isDeclined(params, result) {
+  const outcome = result?.outcome
+  if (!outcome) return false
+  if (outcome.outcome === 'cancelled') return true
+  const options = Array.isArray(params?.options) ? params.options : []
+  const chosen = options.find(option => option?.optionId === outcome.optionId)
+  return String(chosen?.kind || '').startsWith('reject')
+}
+
 function textFromUpdate(update) {
   if (
     update?.sessionUpdate !== 'agent_message_chunk'
@@ -327,10 +347,12 @@ export class AcpProcessClient {
     const active = this.activePrompts.get(String(params.sessionId))
     active?.pauseTimeout?.()
     try {
-      return await this.onPermission(params, {
+      const outcome = await this.onPermission(params, {
         signal,
         session: this.sessions.get(String(params.sessionId)),
       })
+      if (active && isDeclined(params, outcome)) active.declined = true
+      return outcome
     } finally {
       active?.resumeTimeout?.()
     }
@@ -602,6 +624,13 @@ export class AcpProcessClient {
           { signal: combined, timeoutMs: 0 },
         )
       } catch (error) {
+        if (active.declined && declineEndsTask() && !signal?.aborted && !timeoutController.signal.aborted) {
+          return {
+            content: DECLINED_RESULT,
+            contentBlocks: [{ type: 'text', text: DECLINED_RESULT }],
+            response: { stopReason: 'end_turn' },
+          }
+        }
         if (!timeoutController.signal.aborted || signal?.aborted) throw error
         throw new AgentError(
           `${this.label} ACP 请求超时（${timeoutDuration(timeoutMs)}）`,
