@@ -17,6 +17,19 @@ function pendingReceipt() {
   return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_PENDING_RECEIPT || '').trim())
 }
 
+// GPT_LIVE_1_APPROVAL_ACK_ONLY (off by default): the task often finishes
+// while the approval is being acknowledged; the ack then guessed the result
+// (it said a file was written with "hello world"), and the result announcement
+// said it again. On, the ack is a bare acknowledgement and the result is told
+// once, by its own announcement.
+const APPROVAL_ACK_ONLY = [
+  '只用一个极短的口头确认，不要描述执行进度、结果或任何内容；结果稍后会单独告诉用户。',
+]
+
+function approvalAckOnly() {
+  return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_APPROVAL_ACK_ONLY || '').trim())
+}
+
 // GPT_LIVE_1_REJECT_REDO (off by default): an earbud user correcting the
 // request at the permission prompt ("not empty, write 你好 in it") was taken as
 // a plain no, and the reject reply forbade any tool call, so nothing was redone.
@@ -488,12 +501,12 @@ export class AgentTaskRuntime {
             : decision === 'always'
               ? [
                 '权限决定已提交，并在本会话立即生效。',
-                '只用一句简短自然口语确认“已允许，后台继续执行”。',
+                ...(approvalAckOnly() ? APPROVAL_ACK_ONLY : ['只用一句简短自然口语确认“已允许，后台继续执行”。']),
                 '不要重述操作，不要再次询问或调用工具。',
               ].join(' ')
               : [
                 '该任务已获准继续执行，后续权限请求由网关自动处理。',
-                '只用一句简短自然口语确认“已允许，后台继续执行”。',
+                ...(approvalAckOnly() ? APPROVAL_ACK_ONLY : ['只用一句简短自然口语确认“已允许，后台继续执行”。']),
                 '不要重述操作，不要再次询问或调用工具。',
               ].join(' '),
         }

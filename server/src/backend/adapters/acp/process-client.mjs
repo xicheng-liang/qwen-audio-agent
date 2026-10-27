@@ -75,7 +75,7 @@ function finalTextOnly() {
 // [ede_diagnostic] ... stop_reason=tool_use"), so the user's "no" became a
 // failed task. On, that one failure, after the user chose a reject option,
 // ends as a result saying the operation was not run.
-const DECLINED_RESULT = '用户拒绝了这项操作，后台没有执行。'
+const DECLINED_RESULT = '用户拒绝了这项操作，整项工作已停止，没有执行。不要追问其他做法，除非用户自己提出新的要求。'
 const DECLINE_FAILURE = /ede_diagnostic|stop_reason=tool_use/
 
 function declineEndsTask() {

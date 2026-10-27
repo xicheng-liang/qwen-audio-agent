@@ -654,7 +654,8 @@ function declineHarness(t, { knob, choose }) {
 test('GPT_LIVE_1_DECLINE_ENDS_TASK turns the failure after a declined permission into a result', async t => {
   const client = declineHarness(t, { knob: 'on', choose: 'reject' })
   const result = await client.prompt('session-decline', 'delete the file')
-  assert.equal(result.content, '用户拒绝了这项操作，后台没有执行。')
+  assert.match(result.content, /^用户拒绝了这项操作，整项工作已停止，没有执行。/)
+  assert.match(result.content, /不要追问其他做法/)
   assert.equal(result.response.stopReason, 'end_turn')
 })
 

@@ -2076,6 +2076,28 @@ test('confirms a rejected realtime permission exactly once', async () => {
   await kit.finish()
 })
 
+test('GPT_LIVE_1_APPROVAL_ACK_ONLY keeps the approval ack from describing the result', async t => {
+  const before = process.env.GPT_LIVE_1_APPROVAL_ACK_ONLY
+  process.env.GPT_LIVE_1_APPROVAL_ACK_ONLY = 'on'
+  t.after(() => {
+    if (before === undefined) delete process.env.GPT_LIVE_1_APPROVAL_ACK_ONLY
+    else process.env.GPT_LIVE_1_APPROVAL_ACK_ONLY = before
+  })
+  const kit = await permissionHarness({
+    answer: '同意',
+    respondPermission: async id => ({ id, taskId: 'work-one', status: 'approved' }),
+  })
+  await kit.handler.handle({
+    call_id: 'permission-ack-only',
+    name: 'respond_permission',
+    arguments: JSON.stringify({ permission_id: 'auth-one', decision: 'task' }),
+  })
+  const instructions = kit.outputs.at(-1)[3].response.instructions
+  assert.match(instructions, /不要描述执行进度、结果或任何内容/)
+  assert.doesNotMatch(instructions, /已允许，后台继续执行/)
+  await kit.finish()
+})
+
 test('GPT_LIVE_1_REJECT_REDO lets a correction at the permission prompt be redone', async t => {
   const before = process.env.GPT_LIVE_1_REJECT_REDO
   process.env.GPT_LIVE_1_REJECT_REDO = 'on'
