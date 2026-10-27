@@ -351,6 +351,11 @@ export const gptLive1Provider = {
   connectTimeoutMessage: '连接 GPT-Live 1 Live API 超时',
   url: () => config.gptLive1RealtimeUrl,
   headers: () => ({ Authorization: `Bearer ${config.gptLive1ApiKey}` }),
+  // GPT_LIVE_1_CONNECT_RETRIES (0 = off): the internal AI gateway answers some
+  // session starts with model_not_deployed and the next one succeeds; a failed
+  // wake costs the user's turn, so try again at once.
+  connectRetries: () => Math.min(8, Math.max(0, Number(process.env.GPT_LIVE_1_CONNECT_RETRIES) || 0)),
+  retryConnect: message => /model[_ -]?not[_ -]?deployed/i.test(message),
   classifyError: message => {
     if (isRecoverableRealtimeInactivityError(message)) return 'inactivity'
     // Rejected session.update / append are per-command, not session-fatal.

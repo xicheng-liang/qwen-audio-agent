@@ -1404,6 +1404,70 @@ async function liveMockServer(t, onMessage = () => {}) {
   return { connections }
 }
 
+// The first `failures` session starts are refused the way the internal AI
+// gateway refuses them intermittently; later ones start.
+async function flakyDeploymentServer(t, failures) {
+  const server = new WebSocketServer({ host: '127.0.0.1', port: 0 })
+  await new Promise(resolve => server.once('listening', resolve))
+  let starts = 0
+  const sockets = []
+  server.on('connection', socket => {
+    sockets.push(socket)
+    socket.on('message', raw => {
+      if (JSON.parse(raw.toString()).type !== 'session.start') return
+      starts += 1
+      socket.send(JSON.stringify(starts <= failures
+        ? { type: 'error', error: { type: 'invalid_request_error', code: 'model_not_deployed', message: "Model deployment 'gpt-live-1-gs' was not found." } }
+        : { type: 'session.started', session: { id: `sess_${starts}` } }))
+    })
+  })
+  withConfig(t, {
+    gptLive1ApiKey: 'live-test',
+    gptLive1Model: 'gpt-live-1',
+    gptLive1RealtimeUrl: `ws://127.0.0.1:${server.address().port}/v1/live/sessions`,
+  })
+  t.after(async () => {
+    for (const socket of sockets) socket.terminate()
+    await new Promise(resolve => server.close(resolve))
+  })
+  return { starts: () => starts }
+}
+
+test('GPT_LIVE_1_CONNECT_RETRIES retries model_not_deployed at once and the session never sees the failures', async t => {
+  withEnv(t, { GPT_LIVE_1_CONNECT_RETRIES: '4' })
+  const server = await flakyDeploymentServer(t, 3)
+  const errors = []
+  let closes = 0
+  const frontend = new RealtimeFrontend({
+    provider: gptLive1Provider,
+    agentContext: {},
+    onError: error => errors.push(error),
+    onClose: () => { closes += 1 },
+  })
+  t.after(() => frontend.close())
+  await frontend.connect()
+  assert.equal(server.starts(), 4)
+  assert.equal(closes, 0, 'abandoned sockets do not close the session')
+})
+
+test('GPT-Live 1 connect fails on model_not_deployed when retries are off', async t => {
+  withEnv(t, { GPT_LIVE_1_CONNECT_RETRIES: undefined })
+  const server = await flakyDeploymentServer(t, 1)
+  const frontend = new RealtimeFrontend({ provider: gptLive1Provider, agentContext: {} })
+  t.after(() => frontend.close())
+  await assert.rejects(frontend.connect(), /model_not_deployed/)
+  assert.equal(server.starts(), 1)
+})
+
+test('GPT-Live 1 gives up after the configured retries', async t => {
+  withEnv(t, { GPT_LIVE_1_CONNECT_RETRIES: '2' })
+  const server = await flakyDeploymentServer(t, 5)
+  const frontend = new RealtimeFrontend({ provider: gptLive1Provider, agentContext: {} })
+  t.after(() => frontend.close())
+  await assert.rejects(frontend.connect(), /model_not_deployed/)
+  assert.equal(server.starts(), 3)
+})
+
 test('GPT-Live 1 idle close is off by default and floored when enabled', t => {
   withEnv(t, { GPT_LIVE_1_IDLE_CLOSE_MS: undefined })
   assert.equal(gptLive1Provider.idleCloseMs(), 0)

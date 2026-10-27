@@ -246,12 +246,18 @@ export class RealtimeFrontend {
     } catch (error) {
       return Promise.reject(error)
     }
-    return new Promise((resolve, reject) => {
+    // A provider may name connect errors worth an immediate fresh attempt; the
+    // abandoned socket's events never reach the session.
+    const retries = Math.max(0, Number(this.provider.connectRetries?.() || 0))
+    const attempt = left => new Promise((resolve, reject) => {
       const ws = new WebSocket(this.provider.url(), {
         headers: this.provider.headers(),
       })
       this.ws = ws
       let settled = false
+      let abandoned = false
+      const retryable = error => left > 0
+        && Boolean(this.provider.retryConnect?.(String(error?.message || error)))
       const timeout = setTimeout(() => {
         const error = new Error(this.provider.connectTimeoutMessage)
         finish(error)
@@ -261,10 +267,14 @@ export class RealtimeFrontend {
         if (settled) return
         settled = true
         clearTimeout(timeout)
-        if (error) reject(error)
+        if (error && retryable(error)) {
+          abandoned = true
+          resolve(attempt(left - 1))
+        } else if (error) reject(error)
         else resolve()
       }
       ws.on('open', () => {
+        if (abandoned) return
         try {
           const messages = normalizedEvents(
             this.protocol.connectionMessages?.({
@@ -289,10 +299,12 @@ export class RealtimeFrontend {
         }
       })
       ws.on('error', error => {
-        this.onError?.(error)
+        if (abandoned) return
+        if (settled || !retryable(error)) this.onError?.(error)
         finish(error)
       })
       ws.on('close', () => {
+        if (abandoned) return
         this.ready = false
         this.sessionConfigured = false
         this.recentContextInjected = false
@@ -301,6 +313,7 @@ export class RealtimeFrontend {
         this.onClose?.()
       })
       ws.on('message', raw => {
+        if (abandoned) return
         let providerEvent
         try {
           providerEvent = JSON.parse(raw.toString())
@@ -311,7 +324,7 @@ export class RealtimeFrontend {
           this.handleProviderEvent(providerEvent, {
             onSessionReady: () => finish(),
             onSessionError: error => {
-              if (!error.realtimeEvent) this.onError?.(error)
+              if (!error.realtimeEvent && !retryable(error)) this.onError?.(error)
               finish(error)
               ws.terminate()
             },
@@ -323,6 +336,7 @@ export class RealtimeFrontend {
         }
       })
     })
+    return attempt(retries)
   }
 
   emitProviderEvent(providerEvent) {
