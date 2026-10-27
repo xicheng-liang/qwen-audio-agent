@@ -1460,6 +1460,7 @@ test('GPT_LIVE_1_CONNECT_RETRIES retries model_not_deployed at once and the sess
   t.after(() => frontend.close())
   await frontend.connect()
   assert.equal(server.starts(), 4)
+  assert.equal(errors.length, 0, 'refused attempts are not reported to the session')
   assert.equal(closes, 0, 'abandoned sockets do not close the session')
 })
 
@@ -1473,7 +1474,7 @@ test('GPT-Live 1 connect fails on model_not_deployed when retries are off', asyn
 })
 
 test('GPT-Live 1 gives up after the configured retries', async t => {
-  withEnv(t, { GPT_LIVE_1_CONNECT_RETRIES: '2' })
+  withEnv(t, { GPT_LIVE_1_CONNECT_RETRIES: '2.9' })
   const server = await flakyDeploymentServer(t, 5)
   const frontend = new RealtimeFrontend({ provider: gptLive1Provider, agentContext: {} })
   t.after(() => frontend.close())

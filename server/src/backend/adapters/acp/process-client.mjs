@@ -62,23 +62,31 @@ function requestErrorMessage(error, formatRequestError) {
     : message
 }
 
-const TOOL_UPDATES = new Set(['tool_call', 'tool_call_update'])
+// GPT_LIVE_1_FINAL_TEXT_ONLY (off by default): the earbud read out Claude
+// Code's narration before a tool call ("Only the target exists; delete it.")
+// as part of the result. On, the result is the text after the agent's last
+// new tool call; a late status update of an earlier tool does not split it.
+function finalTextOnly() {
+  return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_FINAL_TEXT_ONLY || '').trim())
+}
 
 // GPT_LIVE_1_DECLINE_ENDS_TASK (off by default): Claude Code's ACP adapter
 // answers a rejected permission by failing the prompt ("Internal error:
 // [ede_diagnostic] ... stop_reason=tool_use"), so the user's "no" became a
-// failed task. On, a prompt that fails after the user declined ends as a
-// result saying the operation was not run.
+// failed task. On, that one failure, after the user chose a reject option,
+// ends as a result saying the operation was not run.
 const DECLINED_RESULT = '用户拒绝了这项操作，后台没有执行。'
+const DECLINE_FAILURE = /ede_diagnostic|stop_reason=tool_use/
 
 function declineEndsTask() {
   return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_DECLINE_ENDS_TASK || '').trim())
 }
 
+// Only a reject option the user chose counts; a cancelled outcome can come
+// from an abort or a withdrawn request without the user saying no.
 function isDeclined(params, result) {
   const outcome = result?.outcome
-  if (!outcome) return false
-  if (outcome.outcome === 'cancelled') return true
+  if (outcome?.outcome !== 'selected') return false
   const options = Array.isArray(params?.options) ? params.options : []
   const chosen = options.find(option => option?.optionId === outcome.optionId)
   return String(chosen?.kind || '').startsWith('reject')
@@ -381,7 +389,7 @@ export class AcpProcessClient {
     const active = this.activePrompts.get(sessionId)
     const text = textFromUpdate(update)
     if (active && text) active.text.push(text)
-    else if (active?.text.length && TOOL_UPDATES.has(update.sessionUpdate)) {
+    else if (active?.text.length && update.sessionUpdate === 'tool_call' && finalTextOnly()) {
       // Text before a tool call is the agent narrating its next step, not the
       // answer; the result is what it says after its last tool call.
       active.earlierText = active.text
@@ -624,7 +632,8 @@ export class AcpProcessClient {
           { signal: combined, timeoutMs: 0 },
         )
       } catch (error) {
-        if (active.declined && declineEndsTask() && !signal?.aborted && !timeoutController.signal.aborted) {
+        if (active.declined && declineEndsTask() && DECLINE_FAILURE.test(String(error?.message || error))
+          && !signal?.aborted && !timeoutController.signal.aborted) {
           return {
             content: DECLINED_RESULT,
             contentBlocks: [{ type: 'text', text: DECLINED_RESULT }],

@@ -248,7 +248,7 @@ export class RealtimeFrontend {
     }
     // A provider may name connect errors worth an immediate fresh attempt; the
     // abandoned socket's events never reach the session.
-    const retries = Math.max(0, Number(this.provider.connectRetries?.() || 0))
+    const retries = Math.max(0, Math.floor(Number(this.provider.connectRetries?.() || 0)))
     const attempt = left => new Promise((resolve, reject) => {
       const ws = new WebSocket(this.provider.url(), {
         headers: this.provider.headers(),
@@ -330,7 +330,8 @@ export class RealtimeFrontend {
             },
           })
         } catch (error) {
-          this.onError?.(error)
+          // A refused session start arrives here as a thrown realtime event.
+          if (settled || !retryable(error)) this.onError?.(error)
           finish(error)
           ws.terminate()
         }

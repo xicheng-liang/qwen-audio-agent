@@ -563,7 +563,18 @@ test('preserves all ACP agent message ContentBlocks in prompt results', async ()
   assert.equal(result.response.stopReason, 'end_turn')
 })
 
-test('prompt result is the text after the last tool call, not the narration before it', async () => {
+function withFinalTextOnly(t, value = 'on') {
+  const before = process.env.GPT_LIVE_1_FINAL_TEXT_ONLY
+  if (value === null) delete process.env.GPT_LIVE_1_FINAL_TEXT_ONLY
+  else process.env.GPT_LIVE_1_FINAL_TEXT_ONLY = value
+  t.after(() => {
+    if (before === undefined) delete process.env.GPT_LIVE_1_FINAL_TEXT_ONLY
+    else process.env.GPT_LIVE_1_FINAL_TEXT_ONLY = before
+  })
+}
+
+test('prompt result is the text after the last tool call, not the narration before it', async t => {
+  withFinalTextOnly(t)
   const client = new AcpProcessClient({ label: 'Test Agent', command: 'unused' })
   client.start = async () => {}
   const say = text => ({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } })
@@ -586,7 +597,8 @@ test('prompt result is the text after the last tool call, not the narration befo
   assert.equal(result.content, '已删除桌面上的暗号.txt。')
 })
 
-test('a prompt that ends on a tool call keeps the last text it said', async () => {
+test('a prompt that ends on a tool call keeps the last text it said', async t => {
+  withFinalTextOnly(t)
   const client = new AcpProcessClient({ label: 'Test Agent', command: 'unused' })
   client.start = async () => {}
   client.context = {
@@ -654,6 +666,63 @@ test('a declined permission still fails the prompt when GPT_LIVE_1_DECLINE_ENDS_
 test('an approved permission followed by a failure is still a failure', async t => {
   const client = declineHarness(t, { knob: 'on', choose: 'allow' })
   await assert.rejects(client.prompt('session-decline', 'delete the file'), /ede_diagnostic/)
+})
+
+test('a late status update of an earlier tool does not split the final answer', async t => {
+  withFinalTextOnly(t)
+  const client = new AcpProcessClient({ label: 'Test Agent', command: 'unused' })
+  client.start = async () => {}
+  const say = text => ({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } })
+  client.context = {
+    async request() {
+      for (const update of [
+        say('Checking. '),
+        { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'ls', status: 'pending' },
+        say('已删除。'),
+        { sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed' },
+        say('桌面上没有其他同名文件。'),
+      ]) client.handleUpdate({ sessionId: 'session-late-update', update })
+      return { stopReason: 'end_turn' }
+    },
+    async notify() {},
+  }
+  const result = await client.prompt('session-late-update', 'go')
+  assert.equal(result.content, '已删除。桌面上没有其他同名文件。')
+})
+
+test('without GPT_LIVE_1_FINAL_TEXT_ONLY the result keeps every agent text chunk', async t => {
+  withFinalTextOnly(t, null)
+  const client = new AcpProcessClient({ label: 'Test Agent', command: 'unused' })
+  client.start = async () => {}
+  const say = text => ({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } })
+  client.context = {
+    async request() {
+      for (const update of [
+        say('Only the target exists; delete it.'),
+        { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'rm', status: 'pending' },
+        say('已删除。'),
+      ]) client.handleUpdate({ sessionId: 'session-knob-off', update })
+      return { stopReason: 'end_turn' }
+    },
+    async notify() {},
+  }
+  const result = await client.prompt('session-knob-off', 'go')
+  assert.equal(result.content, 'Only the target exists; delete it.已删除。')
+})
+
+test('a cancelled permission outcome is not a decline', async t => {
+  const client = declineHarness(t, { knob: 'on', choose: 'reject' })
+  client.onPermission = async () => ({ outcome: { outcome: 'cancelled' } })
+  await assert.rejects(client.prompt('session-decline', 'delete the file'), /ede_diagnostic/)
+})
+
+test('after a decline, an unrelated failure still fails the prompt', async t => {
+  const client = declineHarness(t, { knob: 'on', choose: 'reject' })
+  const request = client.context.request
+  client.context.request = async (...args) => {
+    try { await request(...args) } catch { throw new Error('relay connection lost') }
+  }
+  await assert.rejects(client.prompt('session-decline', 'delete the file'), /relay connection lost/)
 })
 
 test('returns ACP stop reasons without interpreting Gateway task state', async () => {
