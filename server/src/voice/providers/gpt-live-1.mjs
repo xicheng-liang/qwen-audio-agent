@@ -68,8 +68,9 @@ function waitPolicy() {
     return ['Do not guess the result while waiting; say briefly that you are checking.']
   }
   return [
-    'Do not guess the result while waiting. If you must fill a pause, use only a',
-    'few neutral words. Never say what you are checking.',
+    'Before you hand a request to the backend, say a very short neutral',
+    'acknowledgement at once, then wait. Never say what you are checking and',
+    'never guess the result.',
     'When you speak a backend result, start with the result itself, with no lead-in.',
   ]
 }

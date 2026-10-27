@@ -110,6 +110,7 @@ test('GPT_LIVE_1_QUIET_WAIT swaps the "say you are checking" line for a neutral,
   const quiet = gptLive1Provider.buildSession({ agentContext: {}, sessionOptions: {} }).instructions
   assert.doesNotMatch(quiet, /say briefly that you are checking/)
   assert.match(quiet, /Never say what you are checking/)
+  assert.match(quiet, /neutral\s+acknowledgement at once/)
   assert.match(quiet, /start with the result itself/)
 })
 
