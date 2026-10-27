@@ -99,6 +99,20 @@ test('an internal AI gateway is only a different endpoint and key', t => {
   assert.equal(session.model, 'live-deployment-a')
 })
 
+test('GPT_LIVE_1_QUIET_WAIT swaps the "say you are checking" line for a neutral, topic-free one', t => {
+  withConfig(t, { gptLive1ApiKey: 'k', gptLive1Model: 'gpt-live-1', gptLive1Voice: '' })
+  withEnv(t, { GPT_LIVE_1_VOICE_INSTRUCTIONS: undefined, GPT_LIVE_1_QUIET_WAIT: undefined })
+  const plain = gptLive1Provider.buildSession({ agentContext: {}, sessionOptions: {} }).instructions
+  assert.match(plain, /say briefly that you are checking/)
+  assert.doesNotMatch(plain, /Never say what you are checking/)
+
+  withEnv(t, { GPT_LIVE_1_QUIET_WAIT: 'on' })
+  const quiet = gptLive1Provider.buildSession({ agentContext: {}, sessionOptions: {} }).instructions
+  assert.doesNotMatch(quiet, /say briefly that you are checking/)
+  assert.match(quiet, /Never say what you are checking/)
+  assert.match(quiet, /start with the result itself/)
+})
+
 test('GPT-Live 1 builds a strict session.start payload with Responses delegation', t => {
   withConfig(t, { gptLive1ApiKey: 'k', gptLive1Model: 'gpt-live-1', gptLive1Voice: '' })
   withEnv(t, {

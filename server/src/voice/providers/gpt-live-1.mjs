@@ -60,6 +60,20 @@ function backendCapabilities(agentContext) {
   })
 }
 
+// GPT_LIVE_1_QUIET_WAIT (off by default): asked to "say briefly that you are
+// checking", the voice opened nearly every delegated reply, results included,
+// with a line guessing the topic ("let me look at the file").
+function waitPolicy() {
+  if (!/^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_QUIET_WAIT || '').trim())) {
+    return ['Do not guess the result while waiting; say briefly that you are checking.']
+  }
+  return [
+    'Do not guess the result while waiting. If you must fill a pause, say only a',
+    'short neutral phrase such as "One moment." Never say what you are checking.',
+    'When you speak a backend result, start with the result itself, with no lead-in.',
+  ]
+}
+
 // Follows the GPT-Live prompting guide: persona, then the Backchannel,
 // Interruption and Delegation policy sections. Task procedure and tool rules
 // live in the backend prompt, not here.
@@ -90,7 +104,7 @@ function voiceInstructions(agentContext) {
     '- You need a brief clarification to understand the request.',
     '',
     'Delegate before giving an answer that depends on backend work.',
-    'Do not guess the result while waiting; say briefly that you are checking.',
+    ...waitPolicy(),
     'Only report an action as done when the backend result says it succeeded.',
     '',
     '# Assistant Profile',
