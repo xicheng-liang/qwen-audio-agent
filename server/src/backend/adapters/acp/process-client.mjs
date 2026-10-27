@@ -62,6 +62,8 @@ function requestErrorMessage(error, formatRequestError) {
     : message
 }
 
+const TOOL_UPDATES = new Set(['tool_call', 'tool_call_update'])
+
 function textFromUpdate(update) {
   if (
     update?.sessionUpdate !== 'agent_message_chunk'
@@ -357,6 +359,12 @@ export class AcpProcessClient {
     const active = this.activePrompts.get(sessionId)
     const text = textFromUpdate(update)
     if (active && text) active.text.push(text)
+    else if (active?.text.length && TOOL_UPDATES.has(update.sessionUpdate)) {
+      // Text before a tool call is the agent narrating its next step, not the
+      // answer; the result is what it says after its last tool call.
+      active.earlierText = active.text
+      active.text = []
+    }
     const contentBlock = contentBlockFromUpdate(update)
     if (active && contentBlock) active.contentBlocks.push(contentBlock)
     try {
@@ -606,7 +614,8 @@ export class AcpProcessClient {
           { status: 504, protocol: 'acp' },
         )
       }
-      const content = active.text.join('').trim()
+      // A turn that ends on a tool call keeps the last text it did say.
+      const content = active.text.join('').trim() || (active.earlierText || []).join('').trim()
       return {
         content,
         contentBlocks: active.contentBlocks,

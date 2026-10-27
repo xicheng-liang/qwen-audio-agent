@@ -563,6 +563,52 @@ test('preserves all ACP agent message ContentBlocks in prompt results', async ()
   assert.equal(result.response.stopReason, 'end_turn')
 })
 
+test('prompt result is the text after the last tool call, not the narration before it', async () => {
+  const client = new AcpProcessClient({ label: 'Test Agent', command: 'unused' })
+  client.start = async () => {}
+  const say = text => ({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } })
+  client.context = {
+    async request() {
+      for (const update of [
+        say('Only the target exists; '),
+        say('delete it.'),
+        { sessionUpdate: 'tool_call', toolCallId: 't1', title: 'rm', status: 'pending' },
+        { sessionUpdate: 'tool_call_update', toolCallId: 't1', status: 'completed' },
+        say('已删除桌面上的暗号.txt。'),
+      ]) client.handleUpdate({ sessionId: 'session-narration', update })
+      return { stopReason: 'end_turn' }
+    },
+    async notify() {},
+  }
+
+  const result = await client.prompt('session-narration', 'delete it')
+
+  assert.equal(result.content, '已删除桌面上的暗号.txt。')
+})
+
+test('a prompt that ends on a tool call keeps the last text it said', async () => {
+  const client = new AcpProcessClient({ label: 'Test Agent', command: 'unused' })
+  client.start = async () => {}
+  client.context = {
+    async request() {
+      client.handleUpdate({
+        sessionId: 'session-tail-tool',
+        update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Done.' } },
+      })
+      client.handleUpdate({
+        sessionId: 'session-tail-tool',
+        update: { sessionUpdate: 'tool_call', toolCallId: 't2', title: 'cleanup', status: 'pending' },
+      })
+      return { stopReason: 'end_turn' }
+    },
+    async notify() {},
+  }
+
+  const result = await client.prompt('session-tail-tool', 'go')
+
+  assert.equal(result.content, 'Done.')
+})
+
 test('returns ACP stop reasons without interpreting Gateway task state', async () => {
   const client = new AcpProcessClient({ label: 'Test Agent', command: 'unused' })
   client.start = async () => {}
