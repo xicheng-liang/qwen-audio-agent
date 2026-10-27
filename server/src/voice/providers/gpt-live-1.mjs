@@ -74,6 +74,21 @@ function waitPolicy() {
   ]
 }
 
+// GPT_LIVE_1_TEXT_UPLINK (off by default): on the earbud the user's words
+// reach the backend as text and the voice layer hears only the silence
+// keepalive, so it explained the silence ("I'm here, it seemed stuck, what
+// did you say?") and then opened every reply that way.
+function textUplinkPolicy() {
+  if (!/^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_TEXT_UPLINK || '').trim())) return []
+  return [
+    '',
+    'Input policy: The user\'s words reach the backend as text, so you may hear',
+    'only silence. That is normal. Never say the connection was stuck or slow,',
+    'never say you did not hear, and never ask the user to repeat; the backend',
+    'reply answers what they said. Do not open replies the same way each time.',
+  ]
+}
+
 // Follows the GPT-Live prompting guide: persona, then the Backchannel,
 // Interruption and Delegation policy sections. Task procedure and tool rules
 // live in the backend prompt, not here.
@@ -106,6 +121,7 @@ function voiceInstructions(agentContext) {
     'Delegate before giving an answer that depends on backend work.',
     ...waitPolicy(),
     'Only report an action as done when the backend result says it succeeded.',
+    ...textUplinkPolicy(),
     '',
     '# Assistant Profile',
     '<assistant_profile authority="persona_only">',
