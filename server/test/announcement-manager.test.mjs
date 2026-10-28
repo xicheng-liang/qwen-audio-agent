@@ -571,9 +571,9 @@ test('GPT_LIVE_1_SPEAK_RESULTS reads short completed results as written, and onl
   assert.equal(speakableResults([done('已在桌面新建空文件 a.txt。')], on), '已在桌面新建空文件 a.txt。')
   assert.equal(speakableResults([done('一'), done('二')], on), '一\n二')
   assert.equal(speakableResults([{ taskId: 't', status: 'failed', error: 'ACP session/new 失败' }], on), '')
-  assert.equal(speakableResults([done('用户拒绝了这项操作，整项工作已停止，没有执行。')], on), '好，已经停下了，没有执行。')
-  assert.equal(speakableResults([done('用户拒绝了这项操作，整项工作已停止，没有执行。'), done('已完成。')], on), '')
-  assert.equal(speakableResults([done('长'.repeat(241))], on), '')
+  assert.equal(speakableResults([done('用户拒绝了这项操作，整项工作已停止，没有执行。')], on), '')
+  assert.equal(speakableResults([done('长'.repeat(451))], on), '')
+  assert.equal(speakableResults([done('Your current workspace is ~/sigma-workspace/claude. '.repeat(6))], on).length > 0, true)
   assert.equal(speakableResults([done('')], on), '')
 })
 

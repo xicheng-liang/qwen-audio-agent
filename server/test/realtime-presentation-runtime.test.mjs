@@ -566,3 +566,23 @@ test('a backend step settling while the voice layer still speaks leaves the turn
   h.backend('response.done', 'resp_2', 'model', turn)
   assert.deepEqual(h.events.filter(event => event.type !== 'response.started').map(event => event.type), [])
 })
+
+test('a result handed to the voice layer to say is delivered, not retried', () => {
+  const { runtime, calls } = harness()
+  runtime.begin({
+    type: 'response.created',
+    response: { id: 'say_1', status: 'in_progress' },
+    response_id: 'say_1',
+    __voicePlayback: true,
+    __voiceOrigin: 'announcement',
+    __voiceContext: { turnId: 'turn-1', turnGeneration: 1, taskIds: ['work-1'] },
+  })
+  runtime.handle({
+    type: 'response.done',
+    response: { id: 'say_1', status: 'completed' },
+    response_id: 'say_1',
+    __voicePlayback: true,
+  })
+  assert.deepEqual(calls.filter(([name]) => name === 'confirmMany'), [['confirmMany', ['work-1']]])
+  assert.equal(calls.some(([name]) => name === 'retryMany'), false)
+})

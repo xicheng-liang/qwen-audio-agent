@@ -500,8 +500,12 @@ export class RealtimePresentationRuntime {
       }
       const owesSpeech = Boolean(context && !failed && this.#speaksFor(context))
       if (owesSpeech) this.#oweResult(id, context)
+      // A result handed to the voice layer to say (GPT-Live commentary) settles
+      // without audio of its own; the voice says it in its next segment, so it
+      // is delivered. Retrying it read the same result out several times.
+      const handedToVoice = event.__voicePlayback === true && !failed
       if (context?.origin === 'announcement') {
-        if (completedNonVoiceAnnouncement) {
+        if (completedNonVoiceAnnouncement || handedToVoice) {
           this.announcements.confirmMany(contextTaskIds(context))
         } else if (context.adoptedBy || owesSpeech) {
           // The voice response speaking this result confirms or retries it.

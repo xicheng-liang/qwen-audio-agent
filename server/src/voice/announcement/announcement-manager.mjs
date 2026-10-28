@@ -473,10 +473,17 @@ export class AnnouncementManager {
 // continuing" and nothing more). On, short results of work that completed are
 // read out as the agent wrote them, once; failures, declines and long results
 // still go to the backend to phrase.
-// Leave it off: a commentary speak does not settle like a response, so the
-// manager retried it and one result was read out two to six times (flow A/B).
-const SPEAKABLE_RESULT_MAX_CHARS = 240
-const DECLINED_SPOKEN = '好，已经停下了，没有执行。'
+// A commentary speak settles without audio of its own; the presentation
+// runtime counts it as delivered (it once retried it, reading a result 2-6x).
+// GPT-Live caps a commentary append at 500 tokens; estimated like the protocol
+// does (a CJK character ~1 token, other text ~4 characters a token).
+const SPEAKABLE_RESULT_MAX_TOKENS = 450
+
+function estimatedTokens(text) {
+  const chars = Array.from(text)
+  const cjk = chars.filter(ch => /[\u3000-\u9fff\uac00-\ud7af\uff00-\uffef]/.test(ch)).length
+  return cjk + Math.ceil((chars.length - cjk) / 4)
+}
 
 // A directly spoken result that was cut off or cancelled after it began has
 // been heard; retrying it read the same result out twice.
@@ -490,12 +497,9 @@ export function speakableResults(announcements, env = process.env) {
   if (!/^(1|on|true|yes)$/i.test(String(env.GPT_LIVE_1_SPEAK_RESULTS || '').trim())) return ''
   if (!announcements.length || announcements.some(item => isReminderDue(item) || item.status !== 'completed')) return ''
   const texts = announcements.map(item => String(item.result || '').trim())
-  // A decline closes the request with one plain sentence instead of letting
-  // the backend improvise ("ok, I'll handle it" after a no).
-  if (texts.every(text => text.startsWith('用户拒绝了这项操作'))) return DECLINED_SPOKEN
   if (texts.some(text => !text || text.startsWith('用户拒绝了这项操作'))) return ''
   const joined = texts.join('\n')
-  return Array.from(joined).length <= SPEAKABLE_RESULT_MAX_CHARS ? joined : ''
+  return estimatedTokens(joined) <= SPEAKABLE_RESULT_MAX_TOKENS ? joined : ''
 }
 
 // GPT_LIVE_1_RESULT_MUST_SPEAK (off by default): on the earbud the backend
