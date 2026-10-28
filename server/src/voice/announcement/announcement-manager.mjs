@@ -389,7 +389,7 @@ export class AnnouncementManager {
         : createAgentDelivery({ ...delivery, text: eventText })
       const direct = speakableResults(batch.announcements)
       const outcome = direct
-        ? await frontend.speak(direct, delivery.origin, delivery.correlation)
+        ? spokenOutcome(await frontend.speak(direct, delivery.origin, delivery.correlation))
         : this.announceIntoContext
         ? await this.deliveryRuntime.deliver(
             boundedDelivery,
@@ -475,6 +475,14 @@ export class AnnouncementManager {
 // still go to the backend to phrase.
 const SPEAKABLE_RESULT_MAX_CHARS = 240
 const DECLINED_SPOKEN = '好，已经停下了，没有执行。'
+
+// A directly spoken result that was cut off or cancelled after it began has
+// been heard; retrying it read the same result out twice.
+function spokenOutcome(outcome) {
+  return outcome?.failed && outcome.responseId && ['cancelled', 'incomplete'].includes(outcome.status)
+    ? { ...outcome, failed: false, completed: true }
+    : outcome
+}
 
 export function speakableResults(announcements, env = process.env) {
   if (!/^(1|on|true|yes)$/i.test(String(env.GPT_LIVE_1_SPEAK_RESULTS || '').trim())) return ''

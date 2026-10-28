@@ -576,3 +576,34 @@ test('GPT_LIVE_1_SPEAK_RESULTS reads short completed results as written, and onl
   assert.equal(speakableResults([done('长'.repeat(241))], on), '')
   assert.equal(speakableResults([done('')], on), '')
 })
+
+test('GPT_LIVE_1_SPEAK_RESULTS speaks a short result once, even when its response is cut off', async t => {
+  const before = process.env.GPT_LIVE_1_SPEAK_RESULTS
+  process.env.GPT_LIVE_1_SPEAK_RESULTS = 'on'
+  t.after(() => {
+    if (before === undefined) delete process.env.GPT_LIVE_1_SPEAK_RESULTS
+    else process.env.GPT_LIVE_1_SPEAK_RESULTS = before
+  })
+  const spoken = []
+  let injected = 0
+  const manager = new AnnouncementManager({
+    getFrontend: () => ({
+      ready: true,
+      speak: async text => {
+        spoken.push(text)
+        return { failed: true, responseId: 'say_1', status: 'incomplete' }
+      },
+      injectResult: async () => {
+        injected += 1
+        return { completed: true, contextInjected: true }
+      },
+    }),
+    batchWindowMs: 0,
+    retryBaseMs: 5,
+  })
+  manager.completed({ id: 'task_1', objective: '建文件', result: '已在桌面新建 a.txt。' })
+  await new Promise(resolve => setTimeout(resolve, 60))
+  assert.deepEqual(spoken, ['已在桌面新建 a.txt。'])
+  assert.equal(injected, 0)
+  manager.close()
+})
