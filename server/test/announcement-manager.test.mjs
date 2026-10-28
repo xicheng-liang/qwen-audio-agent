@@ -607,3 +607,16 @@ test('GPT_LIVE_1_SPEAK_RESULTS speaks a short result once, even when its respons
   assert.equal(injected, 0)
   manager.close()
 })
+
+test('GPT_LIVE_1_RESULT_MUST_SPEAK tells the backend the user has not heard the result', t => {
+  const before = process.env.GPT_LIVE_1_RESULT_MUST_SPEAK
+  t.after(() => {
+    if (before === undefined) delete process.env.GPT_LIVE_1_RESULT_MUST_SPEAK
+    else process.env.GPT_LIVE_1_RESULT_MUST_SPEAK = before
+  })
+  const items = [{ taskId: 't', status: 'completed', objective: '建文件', result: '已建好。' }]
+  delete process.env.GPT_LIVE_1_RESULT_MUST_SPEAK
+  assert.doesNotMatch(formatWorkResults(items), /用户还没有听到这个结果/)
+  process.env.GPT_LIVE_1_RESULT_MUST_SPEAK = 'on'
+  assert.match(formatWorkResults(items), /用户还没有听到这个结果。必须用一两句话说出结果本身/)
+})

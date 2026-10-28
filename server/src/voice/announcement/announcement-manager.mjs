@@ -473,6 +473,8 @@ export class AnnouncementManager {
 // continuing" and nothing more). On, short results of work that completed are
 // read out as the agent wrote them, once; failures, declines and long results
 // still go to the backend to phrase.
+// Leave it off: a commentary speak does not settle like a response, so the
+// manager retried it and one result was read out two to six times (flow A/B).
 const SPEAKABLE_RESULT_MAX_CHARS = 240
 const DECLINED_SPOKEN = '好，已经停下了，没有执行。'
 
@@ -496,6 +498,16 @@ export function speakableResults(announcements, env = process.env) {
   return Array.from(joined).length <= SPEAKABLE_RESULT_MAX_CHARS ? joined : ''
 }
 
+// GPT_LIVE_1_RESULT_MUST_SPEAK (off by default): on the earbud the backend
+// often dropped a result that landed right after it said "ok, continuing", as
+// if it had been told already (mock-agent flow A/B: 1 of 3 approve runs spoke
+// the result). On, the result block says the user has not heard it yet.
+const RESULT_MUST_SPEAK = '用户还没有听到这个结果。必须用一两句话说出结果本身：做成了什么，或者已经停止、没有执行；即使你刚说过“好的”或“继续处理”也要说。'
+
+function resultMustSpeak(env = process.env) {
+  return /^(1|on|true|yes)$/i.test(String(env.GPT_LIVE_1_RESULT_MUST_SPEAK || '').trim())
+}
+
 export function formatWorkResults(announcements) {
   const blocks = announcements.map(item => [
     `task_id: ${item.taskId}`,
@@ -507,6 +519,7 @@ export function formatWorkResults(announcements) {
   ].filter(Boolean).join('\n'))
   return [
     '以下是你先前异步执行工作的最终更新，不是用户的新请求。请作为自己的工作结果自然告知用户，不要提后台 Agent、协议或 Task，也不要读出 task_id。',
+    ...(resultMustSpeak() ? [RESULT_MUST_SPEAK] : []),
     ...blocks.map(block => `\n${block}`),
   ].join('\n')
 }
