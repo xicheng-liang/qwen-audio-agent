@@ -387,7 +387,10 @@ export class AnnouncementManager {
       const boundedDelivery = eventText === delivery.text
         ? delivery
         : createAgentDelivery({ ...delivery, text: eventText })
-      const outcome = this.announceIntoContext
+      const direct = speakableResults(batch.announcements)
+      const outcome = direct
+        ? await frontend.speak(direct, delivery.origin, delivery.correlation)
+        : this.announceIntoContext
         ? await this.deliveryRuntime.deliver(
             boundedDelivery,
             { injectContext: !batch.contextInjected },
@@ -463,6 +466,22 @@ export class AnnouncementManager {
     this.closed = true
     this.pause()
   }
+}
+
+// GPT_LIVE_1_SPEAK_RESULTS (off by default): on the earbud the backend often
+// dropped a result that landed right after it acknowledged an approval ("ok,
+// continuing" and nothing more). On, short results of work that completed are
+// read out as the agent wrote them, once; failures, declines and long results
+// still go to the backend to phrase.
+const SPEAKABLE_RESULT_MAX_CHARS = 240
+
+export function speakableResults(announcements, env = process.env) {
+  if (!/^(1|on|true|yes)$/i.test(String(env.GPT_LIVE_1_SPEAK_RESULTS || '').trim())) return ''
+  if (!announcements.length || announcements.some(item => isReminderDue(item) || item.status !== 'completed')) return ''
+  const texts = announcements.map(item => String(item.result || '').trim())
+  if (texts.some(text => !text || text.startsWith('用户拒绝了这项操作'))) return ''
+  const joined = texts.join('\n')
+  return Array.from(joined).length <= SPEAKABLE_RESULT_MAX_CHARS ? joined : ''
 }
 
 export function formatWorkResults(announcements) {

@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   AnnouncementManager,
   formatWorkResults,
+  speakableResults,
 } from '../src/voice/announcement/announcement-manager.mjs'
 import { TaskManager } from '../src/task/task-manager.mjs'
 
@@ -561,4 +562,16 @@ test('releases a poison batch after bounded retries so later results can proceed
   ))
   manager.confirmMany(['healthy'])
   manager.close()
+})
+
+test('GPT_LIVE_1_SPEAK_RESULTS reads short completed results as written, and only those', () => {
+  const on = { GPT_LIVE_1_SPEAK_RESULTS: 'on' }
+  const done = (result, extra = {}) => ({ taskId: 't', status: 'completed', objective: 'x', result, ...extra })
+  assert.equal(speakableResults([done('已在桌面新建空文件 a.txt。')], {}), '')
+  assert.equal(speakableResults([done('已在桌面新建空文件 a.txt。')], on), '已在桌面新建空文件 a.txt。')
+  assert.equal(speakableResults([done('一'), done('二')], on), '一\n二')
+  assert.equal(speakableResults([{ taskId: 't', status: 'failed', error: 'ACP session/new 失败' }], on), '')
+  assert.equal(speakableResults([done('用户拒绝了这项操作，整项工作已停止，没有执行。')], on), '')
+  assert.equal(speakableResults([done('长'.repeat(241))], on), '')
+  assert.equal(speakableResults([done('')], on), '')
 })
