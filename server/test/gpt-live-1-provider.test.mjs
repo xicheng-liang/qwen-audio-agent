@@ -4,7 +4,7 @@ import { WebSocketServer } from 'ws'
 import { config } from '../src/core/config.mjs'
 import { RealtimeFrontend } from '../src/voice/realtime-provider.mjs'
 import { RealtimeProviderSession } from '../src/voice/realtime-provider-session.mjs'
-import { gptLive1Provider, sessionInputHistory } from '../src/voice/providers/gpt-live-1.mjs'
+import { gptLive1Provider, sessionInputHistory, userWordsContext } from '../src/voice/providers/gpt-live-1.mjs'
 import { GatewaySystemEvent, createGatewaySystemEventDelivery } from '../src/delivery/gateway-system-event.mjs'
 import { ToolCallHandler } from '../src/frontend/tools/tool-call-handler.mjs'
 import {
@@ -231,6 +231,33 @@ test('GPT-Live 1 routes task results and permissions through the delegated backe
   assert.match(permissionItem.item.content[0].text, /permission_id=perm_1/)
   assert.equal(protocol.responseInstructionsItem(permission.response), null)
   assert.equal(protocol.responseInstructionsItem(undefined), null)
+})
+
+test('GPT_LIVE_1_TEXT_CONTEXT gives the voice the user\'s words through session.thinking.append', t => {
+  withConfig(t, { gptLive1ApiKey: 'k', gptLive1Model: 'gpt-live-1', gptLive1Voice: '' })
+  const protocol = createGptLive1Protocol()
+  const parts = [{ type: 'text', text: '把桌面上的 a.txt 删掉' }]
+  withEnv(t, { GPT_LIVE_1_TEXT_CONTEXT: undefined, GPT_LIVE_1_TEXT_UPLINK: 'on', GPT_LIVE_1_VOICE_INSTRUCTIONS: undefined })
+  assert.equal(gptLive1Provider.projectUserInput({ parts, options: {}, protocol }), null)
+  assert.match(gptLive1Provider.buildSession({ agentContext: {}, sessionOptions: {} }).instructions, /cannot know what the user said/)
+
+  withEnv(t, { GPT_LIVE_1_TEXT_CONTEXT: 'on' })
+  const projected = gptLive1Provider.projectUserInput({ parts, options: {}, protocol })
+  assert.deepEqual(projected.beforeEvents, [{
+    type: 'session.thinking.append', delegation_id: null, content: 'The user just said: "把桌面上的 a.txt 删掉"',
+  }])
+  assert.deepEqual(projected.conversationItem, protocol.userTextItem('把桌面上的 a.txt 删掉'))
+  const instructions = gptLive1Provider.buildSession({ agentContext: {}, sessionOptions: {} }).instructions
+  assert.match(instructions, /given to you as context starting\s+"The user just said"/)
+  assert.doesNotMatch(instructions, /cannot know what the user said/)
+  assert.equal(userWordsContext([{ type: 'text', text: '长'.repeat(1000) }]).length, 'The user just said: ""'.length + 900)
+})
+
+test('a refused session.thinking.append stays internal', () => {
+  const protocol = createGptLive1Protocol()
+  const encoded = protocol.encodeOutgoing({ type: 'session.thinking.append', delegation_id: null, content: 'x' })
+  const out = protocol.normalizeIncoming({ type: 'error', error: { type: 'invalid_request_error', message: 'rejected', client_event_id: encoded.event_id } })
+  assert.deepEqual([out].flat().filter(Boolean), [])
 })
 
 test('GPT-Live 1 protocol encodes the documented client events', () => {

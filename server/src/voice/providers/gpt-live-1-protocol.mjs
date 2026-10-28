@@ -1216,6 +1216,12 @@ export function createGptLive1Protocol({
         && (payload.type === 'response.create' || payload.type === 'session.commentary.append')) {
         cancelTailRequestAt = now()
       }
+      // The user's words mirrored as voice context (GPT_LIVE_1_TEXT_CONTEXT):
+      // a refusal must not fail the user's turn, so its error stays internal.
+      if (payload.type === 'session.thinking.append') {
+        relayIds.add(encoded.event_id)
+        if (relayIds.size > 32) relayIds.delete(relayIds.values().next().value)
+      }
       if (payload.type === 'response.item.create' && payload.item?.type === 'function_call_output') {
         pendingFunctionCalls.delete(payload.item.call_id)
       }

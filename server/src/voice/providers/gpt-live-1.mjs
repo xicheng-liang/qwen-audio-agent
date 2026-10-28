@@ -5,6 +5,7 @@ import {
   resolveRealtimeModelProfile,
 } from '../../../../shared/realtime-model-catalog.mjs'
 import { PERMISSION_DECISIONS } from '../../../../shared/permission-decisions.mjs'
+import { frontendInputProjection, inputText } from '../../../../shared/input-parts.mjs'
 import { resolveAssistantProfile } from '../../conversation/frontend-agent-context.mjs'
 import {
   buildFrontendInstructions,
@@ -75,6 +76,22 @@ function waitPolicy() {
   ]
 }
 
+// GPT_LIVE_1_TEXT_CONTEXT (off by default): on the text uplink the voice layer
+// never learned what the user said; mid-session text with the user role is
+// not accepted (startup input only), so each turn's words are also given to
+// the voice as factual context through session.thinking.append, the
+// documented "add factual context without asking the model to say it".
+const THINKING_MAX_CHARS = 900
+
+function textContext() {
+  return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_TEXT_CONTEXT || '').trim())
+}
+
+export function userWordsContext(parts) {
+  const said = Array.from(String(inputText(parts) || '').trim()).slice(0, THINKING_MAX_CHARS).join('')
+  return said ? `The user just said: "${said}"` : ''
+}
+
 // GPT_LIVE_1_TEXT_UPLINK (off by default): on the earbud the user's words
 // reach the backend as text and the voice layer hears only the silence
 // keepalive, so it explained the silence ("I'm here, it seemed stuck, what
@@ -87,8 +104,16 @@ function textUplinkPolicy() {
     'only silence. That is normal. Never say the connection was stuck or slow,',
     'never say you did not hear, and never ask the user to repeat; the backend',
     'reply answers what they said. Do not open replies the same way each time.',
-    'Because you cannot know what the user said, never answer by yourself:',
-    'after the short acknowledgement, say only what the backend returns.',
+    ...(textContext()
+      ? [
+          'Each thing the user says is also given to you as context starting',
+          '"The user just said". Use it to understand them, but let the backend',
+          'answer: after a short acknowledgement, say what the backend returns.',
+        ]
+      : [
+          'Because you cannot know what the user said, never answer by yourself:',
+          'after the short acknowledgement, say only what the backend returns.',
+        ]),
   ]
 }
 
@@ -385,6 +410,18 @@ export const gptLive1Provider = {
     if (/invalid[_ -]?api[_ -]?key|authentication|unauthorized|forbidden|unexpected server response: (?:401|403)|model[_ -]?not[_ -]?found/i.test(message)) return 'fatal'
     if (/content[_ -]?(?:filter|moderation|safety|policy)|policy violation/i.test(message)) return 'content_safety'
     return 'other'
+  },
+
+  // GPT_LIVE_1_TEXT_CONTEXT: the user's words reach the voice as context too.
+  projectUserInput: ({ parts, options, protocol }) => {
+    if (!textContext()) return null
+    const content = frontendInputProjection(parts, options)
+    if (!content) return null
+    const said = userWordsContext(parts)
+    return {
+      beforeEvents: said ? [{ type: 'session.thinking.append', delegation_id: null, content: said }] : [],
+      conversationItem: protocol.userTextItem(content),
+    }
   },
 
   buildSession: ({ agentContext, sessionOptions }) => {
