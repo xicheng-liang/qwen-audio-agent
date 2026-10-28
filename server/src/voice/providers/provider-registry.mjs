@@ -42,6 +42,7 @@ const CAPABILITY_FLAGS = [
   'mutableSession',
   'imageRequiresAudioStart',
   'concurrentVoicePlayback',
+  'answerHandover',
 ]
 
 const MODEL_CAPABILITY_FLAGS = [

@@ -62,16 +62,16 @@ function requestErrorMessage(error, formatRequestError) {
     : message
 }
 
-// GPT_LIVE_1_FINAL_TEXT_ONLY (off by default): the earbud read out Claude
-// Code's narration before a tool call ("Only the target exists; delete it.")
+// GPT_LIVE_1_FINAL_TEXT_ONLY (off by default): the earbud read out an agent's
+// narration before a tool call ("Only the target exists; delete it.")
 // as part of the result. On, the result is the text after the agent's last
 // new tool call; a late status update of an earlier tool does not split it.
 function finalTextOnly() {
   return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_FINAL_TEXT_ONLY || '').trim())
 }
 
-// GPT_LIVE_1_DECLINE_ENDS_TASK (off by default): Claude Code's ACP adapter
-// answers a rejected permission by failing the prompt ("Internal error:
+// GPT_LIVE_1_DECLINE_ENDS_TASK (off by default): some ACP adapters answer
+// a rejected permission by failing the prompt ("Internal error:
 // [ede_diagnostic] ... stop_reason=tool_use"), so the user's "no" became a
 // failed task. On, that one failure, after the user chose a reject option,
 // ends as a result saying the operation was not run.

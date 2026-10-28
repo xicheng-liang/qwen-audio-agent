@@ -385,6 +385,9 @@ export const gptLive1Provider = {
     // The Live model keeps speaking while the backend works, so tool-result
     // continuations must not wait for the synthetic voice playback response.
     concurrentVoicePlayback: true,
+    // Hearing the user's audio, the voice decides on its own what reaches the
+    // backend; an answer to a pending request it did not pass on is handed over.
+    get answerHandover() { return audioUplink() },
   },
 
   model: () => config.gptLive1Model,

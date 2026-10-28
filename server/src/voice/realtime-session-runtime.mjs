@@ -31,6 +31,8 @@ import { frontendToolRegistry } from '../frontend/frontend-tools.mjs'
 const MAX_PENDING_AUDIO_CHUNKS = 30
 const RESPONSE_START_WATCHDOG_MS = 12000
 const PERMISSION_RESPONSE_GRACE_MS = 800
+// answerHandover: how long the voice gets to pass an answer on before the backend gets it.
+const ANSWER_HANDOVER_MS = 5_000
 const RESPONSE_CONTEXT_CLEANUP_MS = 30000
 const REALTIME_STABLE_CONNECTION_MS = 10000
 
@@ -80,6 +82,7 @@ export function createRealtimeSessionRuntime({
   let responseTurnCandidate = null
   let responseStartWatchdog = null
   let permissionResponseTimer = null
+  let answerHandoverTimer = null
   let sleeping = false
   let waking = false
   let sleepController
@@ -507,7 +510,33 @@ export function createRealtimeSessionRuntime({
     responseTurnCandidate = null
   }
 
+  // Requests put to the user before this turn began, still waiting for an answer.
+  const answerableRequestIds = context => taskCoordinator.activeTasks().flatMap(task => [
+    task.authorization?.status === 'pending' ? task.authorization.id : null,
+    task.inputRequest?.status === 'pending' ? task.inputRequest.id : null,
+  ]).filter(id => id && !toolCalls.submittedBackendPermissions.has(id) && turns.beganAfterRequest(context.turnId, id))
+  // answerHandover: the voice may answer a bare 同意 itself and never delegate it.
+  // When the request is still unanswered a moment later, the backend gets the
+  // user's words as text and decides from them (no keyword rules here).
+  const scheduleAnswerHandover = context => {
+    clearTimeout(answerHandoverTimer)
+    if (!answerableRequestIds(context).length) return
+    answerHandoverTimer = setTimeout(async () => {
+      answerHandoverTimer = null
+      const pending = answerableRequestIds(context)
+      if (!pending.length) return
+      const text = String(await transcripts.transcript(context.turnId) || '').trim()
+      if (!text || !realtimeSession.frontend) return
+      connectionLogger.info('realtime.answer_handover', { turnId: context.turnId, requests: pending.length })
+      realtimeSession.frontend.sendUserText(text, {
+        turnId: context.turnId,
+        turnGeneration: context.turnGeneration,
+      }).catch(error => emit({ type: 'error', message: `暂时无法处理回答：${error.message}` }))
+    }, config.answerHandoverMs ?? ANSWER_HANDOVER_MS)
+    answerHandoverTimer.unref?.()
+  }
   const ensurePermissionResponseFor = context => {
+    if (realtimeSession.frontend?.capabilities?.answerHandover) scheduleAnswerHandover(context)
     clearTimeout(permissionResponseTimer)
     const hasPendingPermission = () => (realtimeSession.frontend?.capabilities?.concurrentVoicePlayback
       ? taskCoordinator.activeTasks().some(({ authorization }) => (
@@ -598,7 +627,8 @@ export function createRealtimeSessionRuntime({
     },
     clearResponseCandidate,
     expectResponseFor,
-    shouldEnsurePermissionResponse: context => responseTurnCandidate === context,
+    shouldEnsurePermissionResponse: context => responseTurnCandidate === context
+      || Boolean(realtimeSession.frontend?.capabilities?.answerHandover),
     ensurePermissionResponseFor,
     reportFrontendError,
     onSpeechStarted: fields => {
@@ -1257,6 +1287,7 @@ export function createRealtimeSessionRuntime({
       taskCoordinator.close()
       unsubscribeMemory()
       clearResponseCandidate()
+      clearTimeout(answerHandoverTimer)
       turns.close()
       transcripts.close()
       turnCitations.clear()

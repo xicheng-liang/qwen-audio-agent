@@ -69,7 +69,7 @@ function harness(t, { backend = true, idleCloseMs, ...overrides } = {}) {
       subscribe(listener) { memoryListeners.add(listener); return () => memoryListeners.delete(listener) },
     },
     inputAssets: new InputAssetRegistry(), conversationSync,
-    config: { sleepTimeoutMs: 0, announcementQuietMs: 0, announcementBatchMs: 0, taskNotificationClaimTtlMs: 60000 },
+    config: { sleepTimeoutMs: 0, announcementQuietMs: 0, announcementBatchMs: 0, taskNotificationClaimTtlMs: 60000, answerHandoverMs: 20 },
     realtimeProviderRegistry: { resolve: () => provider }, defaultRealtimeProvider: 'test',
     taskAnnouncementFactory: createTaskAnnouncementRuntime,
     realtimeFrontendFactory: options => {
@@ -634,4 +634,65 @@ test('a result whose wake failed is announced by a retried wake, with no client 
   assert.equal(h.frontends.length, 2, 'no retry before 2 s')
   await until(() => h.frontends[2]?.deliveries.some(delivery => delivery.origin === 'announcement'), 2000)
   assert.deepEqual(h.events.slice(before), [], 'the failed wake and its retry stay invisible')
+})
+
+// Audio-uplink voices may answer a spoken 同意 themselves without passing it on.
+function handoverFrontend(f) {
+  f.capabilities = { concurrentVoicePlayback: true, answerHandover: true }
+  f.texts = []
+  f.sendUserText = async (text, context) => { f.texts.push({ text, context }) }
+  return f
+}
+async function presentPermission(h, f, { afterTurn } = {}) {
+  const task = h.request('delete a file')
+  await until(() => h.runs.has(task.id))
+  h.runs.get(task.id).onEvent({ type: 'backend.permission.requested', permission: {
+    id: 'auth-handover', status: 'pending', summary: 'delete a file',
+  } })
+  if (afterTurn) f.settle({ origin: 'agent', context: { turnId: afterTurn }, outcome: { timedOut: true, phase: 'start' } })
+  await until(() => f.deliveries.some(delivery => delivery.origin === 'permission'))
+  return task
+}
+function say(h, f, itemId, transcript) {
+  f.emit({ type: 'input_audio_buffer.speech_started', item_id: itemId })
+  f.emit({ type: 'input_audio_buffer.speech_stopped', item_id: itemId })
+  f.emit({ type: 'conversation.item.input_audio_transcription.completed', item_id: itemId, transcript })
+  return h.events.findLast(event => event.type === 'turn.started').turnId
+}
+
+test('answerHandover: an answer the voice did not pass on reaches the backend as text', async t => {
+  const h = harness(t)
+  const f = handoverFrontend(await h.connect())
+  await presentPermission(h, f)
+  const turnId = say(h, f, 'answer', '同意')
+  await until(() => f.texts.length === 1)
+  assert.equal(f.texts[0].text, '同意')
+  assert.equal(f.texts[0].context.turnId, turnId)
+})
+
+test('answerHandover: none once the request was answered, or for speech before it was asked', async t => {
+  const h = harness(t)
+  const f = handoverFrontend(await h.connect())
+  f.emit({ type: 'input_audio_buffer.speech_started', item_id: 'early' })
+  f.emit({ type: 'input_audio_buffer.speech_stopped', item_id: 'early' })
+  const early = h.events.findLast(event => event.type === 'turn.started').turnId
+  const task = await presentPermission(h, f, { afterTurn: early })
+  // Transcribed only after the question was asked, but spoken before it.
+  f.emit({ type: 'conversation.item.input_audio_transcription.completed', item_id: 'early', transcript: '帮我删掉' })
+  await new Promise(resolve => setTimeout(resolve, 60))
+  assert.equal(f.texts.length, 0)
+  say(h, f, 'answer', '同意')
+  h.runs.get(task.id).onEvent({ type: 'backend.permission.resolved', permission: { id: 'auth-handover', status: 'approved' } })
+  await new Promise(resolve => setTimeout(resolve, 60))
+  assert.equal(f.texts.length, 0)
+})
+
+test('answerHandover: providers without it never resend the answer', async t => {
+  const h = harness(t)
+  const f = handoverFrontend(await h.connect())
+  f.capabilities = { concurrentVoicePlayback: true }
+  await presentPermission(h, f)
+  say(h, f, 'answer', '同意')
+  await new Promise(resolve => setTimeout(resolve, 60))
+  assert.equal(f.texts.length, 0)
 })
