@@ -592,6 +592,12 @@ export class AgentTaskRuntime {
         )
         return
       }
+      if (this.host.answersRequest?.(turnId, authorizationId) === false) {
+        await this.host.sendOutput(callId, failure(
+          'permission_not_answered', '用户还没有回答这个权限请求；请求仍待确认。', { retryable: false },
+        ), turnId, null, responseOptions('用户还没有回答这个权限请求。不要代替用户决定，简短询问是否允许，不要调用工具。'))
+        return
+      }
       if (!this.host.taskOperations.respondAuthorization) {
         await this.host.sendOutput(
           callId,
@@ -660,6 +666,15 @@ export class AgentTaskRuntime {
         '当前没有仍在等待回答的后台输入请求。',
       ), turnId, null, {
         response: { instructions: '简短说明这次回答没有提交成功，不要声称后台已经继续。' },
+      })
+      return
+    }
+    if (this.host.answersRequest?.(turnId, request.id) === false) {
+      await this.host.sendOutput(callId, failure(
+        'input_not_answered',
+        '用户还没有回答这个后台问题；请先向用户转述问题。',
+      ), turnId, null, {
+        response: { instructions: '用户还没有回答这个后台问题。不要代替用户回答，简短转述问题，不要调用工具。' },
       })
       return
     }

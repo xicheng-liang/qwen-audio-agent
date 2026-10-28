@@ -110,3 +110,15 @@ test('interrupt and close advance the stale-event boundary', () => {
   assert.equal(turns.isInputInvalid('item-1'), false)
   assert.equal(turns.committedTurnGeneration, 3)
 })
+
+test('only a turn that began after the Gateway first asked a request answers it', () => {
+  const turns = state()
+  const before = turns.beginManual('typed-before').context.turnId
+  assert.equal(turns.beganAfterRequest(before, 'auth-1'), false, 'not asked yet')
+  turns.noteRequest('auth-1')
+  const after = turns.beginManual('typed-after').context.turnId
+  // Asked again, e.g. after a reconnect: the first ask still counts.
+  turns.noteRequest('auth-1')
+  const later = turns.beginManual('typed-later').context.turnId
+  assert.deepEqual([before, after, later].map(turnId => turns.beganAfterRequest(turnId, 'auth-1')), [false, true, true])
+})

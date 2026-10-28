@@ -200,6 +200,9 @@ export function createRealtimeSessionRuntime({
       onProgressError: error => connectionLogger.warn('progress.injection_failed', {
         error: error.message,
       }),
+      onPresentRequest: requestId => {
+        if (realtimeSession.frontend?.capabilities?.concurrentVoicePlayback) turns.noteRequest(requestId)
+      },
     }),
     onTaskEvent,
     onResult: task => recordTaskResult({ conversationSync, ownerId, sessionId, task }),
@@ -402,7 +405,13 @@ export function createRealtimeSessionRuntime({
         })
       })
     : () => {}
+  // Full duplex: only a turn that began after the Gateway asked answers a request.
+  const answersRequest = (turnId, requestId) => (
+    !realtimeSession.frontend?.capabilities?.concurrentVoicePlayback
+    || turns.beganAfterRequest(turnId, requestId)
+  )
   const toolCalls = new ToolCallHandler({
+    answersRequest,
     taskManager,
     taskOperations,
     ownerId,
@@ -500,7 +509,11 @@ export function createRealtimeSessionRuntime({
 
   const ensurePermissionResponseFor = context => {
     clearTimeout(permissionResponseTimer)
-    const hasPendingPermission = () => taskCoordinator.hasPendingPermission()
+    const hasPendingPermission = () => (realtimeSession.frontend?.capabilities?.concurrentVoicePlayback
+      ? taskCoordinator.activeTasks().some(({ authorization }) => (
+        authorization?.status === 'pending' && turns.beganAfterRequest(context.turnId, authorization.id)
+      ))
+      : taskCoordinator.hasPendingPermission())
     if (!hasPendingPermission()) return
     permissionResponseTimer = setTimeout(() => {
       permissionResponseTimer = null

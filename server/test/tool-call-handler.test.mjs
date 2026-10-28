@@ -2098,6 +2098,24 @@ test('GPT_LIVE_1_APPROVAL_ACK_ONLY keeps the approval ack from describing the re
   await kit.finish()
 })
 
+test('a permission answer from a turn that began before the request is refused', async () => {
+  const calls = []
+  const kit = await permissionHarness({
+    answer: '把桌面上的 a.txt 删掉',
+    respondPermission: async (...args) => { calls.push(args); return { id: 'auth-one', status: 'approved' } },
+  })
+  kit.handler.answersRequest = () => false
+  await kit.handler.handle({
+    call_id: 'permission-too-early',
+    name: 'respond_permission',
+    arguments: JSON.stringify({ permission_id: 'auth-one', decision: 'task' }),
+  })
+  assert.equal(kit.outputs.at(-1)[1].error_code, 'permission_not_answered')
+  assert.match(kit.outputs.at(-1)[3].response.instructions, /不要代替用户决定/)
+  assert.equal(calls.length, 0, 'nothing was approved on the user\'s behalf')
+  await kit.finish()
+})
+
 test('GPT_LIVE_1_REJECT_REDO lets a correction at the permission prompt be redone', async t => {
   const before = process.env.GPT_LIVE_1_REJECT_REDO
   process.env.GPT_LIVE_1_REJECT_REDO = 'on'

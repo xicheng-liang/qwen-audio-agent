@@ -76,6 +76,13 @@ function waitPolicy() {
   ]
 }
 
+// GPT_LIVE_1_AUDIO_UPLINK (off by default): the earbud sends its recording
+// and the voice decides what to delegate; a bare "同意" after a permission
+// prompt was taken as an acknowledgement and never reached the backend.
+function audioUplink() {
+  return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_AUDIO_UPLINK || '').trim())
+}
+
 // GPT_LIVE_1_TEXT_CONTEXT (off by default): on the text uplink the voice layer
 // never learned what the user said; mid-session text with the user role is
 // not accepted (startup input only), so each turn's words are also given to
@@ -140,6 +147,7 @@ function voiceInstructions(agentContext) {
     'Delegate to the backend when:',
     '- The request needs facts, tools, memory, schedules, files or any action.',
     '- A correction changes work already requested.',
+    ...(audioUplink() ? ['- The user answers a question the backend asked (a permission, a choice, a missing detail), however short the answer.'] : []),
     '- The answer needs careful reasoning beyond a brief reply.',
     '',
     'Do not delegate to the backend when:',

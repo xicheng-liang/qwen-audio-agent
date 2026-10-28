@@ -95,6 +95,7 @@ export class ToolCallHandler {
     respondInput,
     permissionPolicy,
     onPermissionDeliveryFailed = () => {},
+    answersRequest = () => true,
     onToolResultReady = () => {},
     onToolCallDebug = () => {},
     onAgentActivity = () => {},
@@ -123,6 +124,7 @@ export class ToolCallHandler {
     this.getClientContext = getClientContext
     this.onMemoryChanged = onMemoryChanged
     this.onPermissionDeliveryFailed = onPermissionDeliveryFailed
+    this.answersRequest = answersRequest
     this.onToolResultReady = onToolResultReady
     this.onToolCallDebug = onToolCallDebug
     this.onAgentActivity = onAgentActivity

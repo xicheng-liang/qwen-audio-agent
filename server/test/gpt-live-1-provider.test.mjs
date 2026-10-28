@@ -233,6 +233,14 @@ test('GPT-Live 1 routes task results and permissions through the delegated backe
   assert.equal(protocol.responseInstructionsItem(undefined), null)
 })
 
+test('GPT_LIVE_1_AUDIO_UPLINK delegates answers to backend questions', t => {
+  withConfig(t, { gptLive1ApiKey: 'k', gptLive1Model: 'gpt-live-1', gptLive1Voice: '' })
+  withEnv(t, { GPT_LIVE_1_VOICE_INSTRUCTIONS: undefined, GPT_LIVE_1_AUDIO_UPLINK: undefined })
+  assert.doesNotMatch(gptLive1Provider.buildSession({ agentContext: {}, sessionOptions: {} }).instructions, /answers a question the backend asked/)
+  withEnv(t, { GPT_LIVE_1_AUDIO_UPLINK: 'on' })
+  assert.match(gptLive1Provider.buildSession({ agentContext: {}, sessionOptions: {} }).instructions, /answers a question the backend asked \(a permission, a choice, a missing detail\)/)
+})
+
 test('GPT_LIVE_1_TEXT_CONTEXT gives the voice the user\'s words through session.thinking.append', t => {
   withConfig(t, { gptLive1ApiKey: 'k', gptLive1Model: 'gpt-live-1', gptLive1Voice: '' })
   const protocol = createGptLive1Protocol()

@@ -24,6 +24,10 @@ export class RealtimeTurnState {
     this.turnSequence = 0
     this.committedTurnId = ''
     this.committedTurnGeneration = 0
+    // Each committed user turn and the turn sequence it began in.
+    this.userTurns = new Map()
+    // The turn sequence when the Gateway first asked each request.
+    this.requestTurns = new Map()
     this.userSpeaking = false
     this.voiceStartItemId = ''
     this.manualInputGeneration = null
@@ -123,7 +127,20 @@ export class RealtimeTurnState {
     if (this.isStale(context)) return false
     this.committedTurnId = context.turnId
     this.committedTurnGeneration = context.turnGeneration
+    this.userTurns.set(context.turnId, context.turnGeneration)
+    if (this.userTurns.size > 100) this.userTurns.delete(this.userTurns.keys().next().value)
     return true
+  }
+
+  noteRequest(requestId) {
+    if (!requestId || this.requestTurns.has(requestId)) return
+    this.requestTurns.set(requestId, this.turnSequence)
+    if (this.requestTurns.size > 100) this.requestTurns.delete(this.requestTurns.keys().next().value)
+  }
+
+  // Only a turn that began after the Gateway asked a request answers it.
+  beganAfterRequest(turnId, requestId) {
+    return this.userTurns.get(turnId) > this.requestTurns.get(requestId)
   }
 
   finishManualResponse(context, { automatic = false } = {}) {
