@@ -37,6 +37,16 @@ function rejectRedo() {
   return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_REJECT_REDO || '').trim())
 }
 
+// GPT_LIVE_1_STATUS_ANSWER (off by default): GPT-Live's delegated backend
+// queried task status again from the continuation of its first query; the
+// repeat was answered as a terminal duplicate with no response, so the backend
+// never produced the answer and the earbud heard only the filler. On, the
+// first repeat in a turn gets the real status and a response; later repeats
+// stay terminal duplicates.
+function statusAnswer() {
+  return /^(1|on|true|yes)$/i.test(String(process.env.GPT_LIVE_1_STATUS_ANSWER || '').trim())
+}
+
 function objectiveFingerprint(objective) {
   return createHash('sha256')
     .update(String(objective || '').replace(/\s+/g, ' ').trim())
@@ -87,6 +97,7 @@ export class AgentTaskRuntime {
   constructor(host) {
     this.host = host
     this.permissionReceipts = new Map()
+    this.statusRepeatAnswered = new Set()
   }
 
   pendingPermissions() {
@@ -198,7 +209,14 @@ export class AgentTaskRuntime {
     const repeatsStatusQuery = Boolean(
       responseId && firstStatusResponse && responseId !== firstStatusResponse,
     )
-    if (followsSpawnReceipt || repeatsStatusQuery) {
+    const answerRepeat = (followsSpawnReceipt || repeatsStatusQuery)
+      && statusAnswer() && turnId && !this.statusRepeatAnswered.has(turnId)
+    if (answerRepeat) {
+      this.statusRepeatAnswered.add(turnId)
+      if (this.statusRepeatAnswered.size > 100) {
+        this.statusRepeatAnswered.delete(this.statusRepeatAnswered.values().next().value)
+      }
+    } else if (followsSpawnReceipt || repeatsStatusQuery) {
       this.host.markTerminalToolResponse(responseId)
       await this.host.sendOutput(callId, {
         status: 'duplicate',

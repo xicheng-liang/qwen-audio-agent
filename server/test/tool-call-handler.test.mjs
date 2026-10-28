@@ -2681,3 +2681,30 @@ test('notes: unavailable without a notes store', async () => {
   })
   assert.equal(kit.outputs.at(-1)[1].error_code, 'notes_unavailable')
 })
+
+test('GPT_LIVE_1_STATUS_ANSWER: the first repeated status query in a turn is answered with a response', async t => {
+  const previous = process.env.GPT_LIVE_1_STATUS_ANSWER
+  process.env.GPT_LIVE_1_STATUS_ANSWER = 'on'
+  t.after(() => {
+    if (previous === undefined) delete process.env.GPT_LIVE_1_STATUS_ANSWER
+    else process.env.GPT_LIVE_1_STATUS_ANSWER = previous
+  })
+  const kit = harness()
+  const task = kit.manager.create({
+    objective: '查询电脑内存', ownerId: 'owner', sessionId: 'voice',
+    runner: async () => ({ content: '24 GB' }),
+  })
+  await kit.manager.wait(task.id)
+  // The repeat names the task (seen live), so the generic same-call guard lets it through.
+  const status = (n, responseId, args = '{}') => kit.handler.handle({
+    call_id: `call-status-${n}`, response_id: responseId, name: 'get_agent_task_status', arguments: args,
+  }, { turnId: 'turn-one', turnGeneration: 1, responseId })
+  await status(1, 'response-first')
+  await status(2, 'response-repeat', JSON.stringify({ task_id: task.id }))
+  assert.equal(kit.outputs.at(-1)[1].status, 'ok')
+  // Not terminal: the response gets its follow-up, so the backend can answer.
+  assert.equal(kit.handler.consumeTerminalToolResponse('response-repeat'), false)
+  await status(3, 'response-third', JSON.stringify({ task_id: task.id, list_all: false }))
+  assert.equal(kit.outputs.at(-1)[1].status, 'duplicate')
+  assert.equal(kit.handler.consumeTerminalToolResponse('response-third'), true)
+})

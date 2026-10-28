@@ -32,7 +32,7 @@ const MAX_PENDING_AUDIO_CHUNKS = 30
 const RESPONSE_START_WATCHDOG_MS = 12000
 const PERMISSION_RESPONSE_GRACE_MS = 800
 // answerHandover: how long the voice gets to pass an answer on before the backend gets it.
-const ANSWER_HANDOVER_MS = 5_000
+const ANSWER_HANDOVER_MS = 2_500
 const RESPONSE_CONTEXT_CLEANUP_MS = 30000
 const REALTIME_STABLE_CONNECTION_MS = 10000
 
