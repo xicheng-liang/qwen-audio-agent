@@ -474,11 +474,15 @@ export class AnnouncementManager {
 // read out as the agent wrote them, once; failures, declines and long results
 // still go to the backend to phrase.
 const SPEAKABLE_RESULT_MAX_CHARS = 240
+const DECLINED_SPOKEN = '好，已经停下了，没有执行。'
 
 export function speakableResults(announcements, env = process.env) {
   if (!/^(1|on|true|yes)$/i.test(String(env.GPT_LIVE_1_SPEAK_RESULTS || '').trim())) return ''
   if (!announcements.length || announcements.some(item => isReminderDue(item) || item.status !== 'completed')) return ''
   const texts = announcements.map(item => String(item.result || '').trim())
+  // A decline closes the request with one plain sentence instead of letting
+  // the backend improvise ("ok, I'll handle it" after a no).
+  if (texts.every(text => text.startsWith('用户拒绝了这项操作'))) return DECLINED_SPOKEN
   if (texts.some(text => !text || text.startsWith('用户拒绝了这项操作'))) return ''
   const joined = texts.join('\n')
   return Array.from(joined).length <= SPEAKABLE_RESULT_MAX_CHARS ? joined : ''

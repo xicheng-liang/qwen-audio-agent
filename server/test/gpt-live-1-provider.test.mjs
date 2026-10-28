@@ -124,6 +124,7 @@ test('GPT_LIVE_1_TEXT_UPLINK tells the voice that silence is normal on a text up
   const uplink = gptLive1Provider.buildSession({ agentContext: {}, sessionOptions: {} }).instructions
   assert.match(uplink, /Input policy: The user's words reach the backend as text/)
   assert.match(uplink, /never ask the user to repeat/)
+  assert.match(uplink, /never answer by yourself/)
 })
 
 test('GPT_LIVE_1_MATCH_LANGUAGE asks the backend to reply in the user\'s language', t => {

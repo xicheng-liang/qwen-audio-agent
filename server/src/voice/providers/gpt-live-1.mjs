@@ -87,6 +87,8 @@ function textUplinkPolicy() {
     'only silence. That is normal. Never say the connection was stuck or slow,',
     'never say you did not hear, and never ask the user to repeat; the backend',
     'reply answers what they said. Do not open replies the same way each time.',
+    'Because you cannot know what the user said, never answer by yourself:',
+    'after the short acknowledgement, say only what the backend returns.',
   ]
 }
 
