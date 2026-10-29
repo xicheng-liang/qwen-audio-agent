@@ -749,7 +749,7 @@ export function createRealtimeSessionRuntime({
         const restoring = ['restore', 'session'].includes(event.__voiceOrigin)
         const failedContext = restoring ? {} : (
           presentationRuntime.get(realtimeResponseId(event)) || {
-            turnId: turns.committedTurnId || turns.turnId,
+            turnId: turns.responseTurn().turnId,
           }
         )
         const generation = ++contentRecoveryGeneration

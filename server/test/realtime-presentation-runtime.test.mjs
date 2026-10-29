@@ -193,6 +193,38 @@ test('correlates an implicit provider response with the pending voice turn', () 
   )
 })
 
+test('ties a reply that starts before the end of speech to the turn under way', () => {
+  // GPT-Live starts a delegated reply a moment before it reports speech_stopped:
+  // that reply answers the new turn, not the last committed one, or its tool
+  // calls are counted against an old turn's budget.
+  const setup = harness()
+  const first = setup.turns.beginVoice('input-1').context
+  setup.turns.endSpeech()
+  setup.turns.completeInput('input-1')
+  setup.turns.commit(first)
+  const second = setup.turns.beginVoice('input-2').context
+
+  deliver(setup.runtime, { type: 'response.created', response: { id: 'resp-2' } })
+
+  assert.equal(setup.runtime.get('resp-2').turnId, second.turnId)
+  assert.equal(setup.runtime.get('resp-2').turnGeneration, second.turnGeneration)
+})
+
+test('a reply after a turn that was only noise stays on the committed turn', () => {
+  const setup = harness()
+  const first = setup.turns.beginVoice('input-1').context
+  setup.turns.endSpeech()
+  setup.turns.completeInput('input-1')
+  setup.turns.commit(first)
+  setup.turns.beginVoice('input-2')
+  setup.turns.endSpeech()
+  setup.turns.completeInput('input-2') // its transcript failed or was empty
+
+  deliver(setup.runtime, { type: 'response.created', response: { id: 'resp-2' } })
+
+  assert.equal(setup.runtime.get('resp-2').turnId, first.turnId)
+})
+
 test('holds audio transcripts until playback starts and records them once', () => {
   const { runtime, events, records, calls } = harness()
   const context = {

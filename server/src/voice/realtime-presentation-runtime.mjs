@@ -146,13 +146,12 @@ export class RealtimePresentationRuntime {
   }
 
   fallbackContext() {
+    const turn = this.turns.responseTurn()
     return {
-      turnId: this.turns.committedTurnId || this.turns.turnId,
+      turnId: turn.turnId,
       taskId: null,
       origin: 'model',
-      turnGeneration: this.turns.committedTurnId
-        ? this.turns.committedTurnGeneration
-        : this.turns.turnGeneration,
+      turnGeneration: turn.turnGeneration,
     }
   }
 
@@ -169,20 +168,17 @@ export class RealtimePresentationRuntime {
     const automaticTurn = automaticResponse
       ? this.getResponseTurnCandidate()
       : null
+    const responseTurn = this.turns.responseTurn()
     const fallback = {
       turnId: source.__voiceContext?.turnId
         || automaticTurn?.turnId
-        || this.turns.committedTurnId
-        || this.turns.turnId,
+        || responseTurn.turnId,
       taskId: source.__voiceContext?.taskId || null,
       origin: source.__voiceOrigin || 'model',
       authorizationId: source.__voiceContext?.authorizationId || null,
       turnGeneration: Number.isInteger(source.__voiceContext?.turnGeneration)
         ? source.__voiceContext.turnGeneration
-        : automaticTurn?.turnGeneration
-          ?? (this.turns.committedTurnId
-            ? this.turns.committedTurnGeneration
-            : this.turns.turnGeneration),
+        : automaticTurn?.turnGeneration ?? responseTurn.turnGeneration,
     }
     const context = mergeResponseContext(
       this.contexts,
