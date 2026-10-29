@@ -197,7 +197,7 @@ test('ties a reply that starts before the end of speech to the turn under way', 
   // GPT-Live starts a delegated reply a moment before it reports speech_stopped:
   // that reply answers the new turn, not the last committed one, or its tool
   // calls are counted against an old turn's budget.
-  const setup = harness()
+  const setup = harness({ concurrentVoicePlayback: true })
   const first = setup.turns.beginVoice('input-1').context
   setup.turns.endSpeech()
   setup.turns.completeInput('input-1')
@@ -210,8 +210,39 @@ test('ties a reply that starts before the end of speech to the turn under way', 
   assert.equal(setup.runtime.get('resp-2').turnGeneration, second.turnGeneration)
 })
 
-test('a reply after a turn that was only noise stays on the committed turn', () => {
+test('without concurrent playback a reply during new speech stays on the committed turn', () => {
+  // A provider that cancels an old reply when the user barges in: the old
+  // reply must not become the answer to the new turn.
   const setup = harness()
+  const first = setup.turns.beginVoice('input-1').context
+  setup.turns.endSpeech()
+  setup.turns.completeInput('input-1')
+  setup.turns.commit(first)
+  setup.turns.beginVoice('input-2')
+
+  deliver(setup.runtime, { type: 'response.created', response: { id: 'resp-1' } })
+
+  assert.equal(setup.runtime.get('resp-1').turnId, first.turnId)
+})
+
+test('a reply after speech that ended without a transcript stays on the committed turn', () => {
+  // Speech that stopped (or was cut off by a dropped connection) and never
+  // committed does not own later replies.
+  const setup = harness({ concurrentVoicePlayback: true })
+  const first = setup.turns.beginVoice('input-1').context
+  setup.turns.endSpeech()
+  setup.turns.completeInput('input-1')
+  setup.turns.commit(first)
+  setup.turns.beginVoice('input-2')
+  setup.turns.endSpeech()
+
+  deliver(setup.runtime, { type: 'response.created', response: { id: 'resp-2' } })
+
+  assert.equal(setup.runtime.get('resp-2').turnId, first.turnId)
+})
+
+test('a reply after a turn that was only noise stays on the committed turn', () => {
+  const setup = harness({ concurrentVoicePlayback: true })
   const first = setup.turns.beginVoice('input-1').context
   setup.turns.endSpeech()
   setup.turns.completeInput('input-1')

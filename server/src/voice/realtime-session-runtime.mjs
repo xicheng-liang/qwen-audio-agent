@@ -276,6 +276,8 @@ export function createRealtimeSessionRuntime({
       }
     },
     onDisconnected: () => {
+      // Speech cut off by a dropped connection has ended; no later reply owns it.
+      turns.endSpeech()
       taskCoordinator.resetPresentation()
       clearVisualInput()
       clearResponseCandidate()
@@ -749,7 +751,7 @@ export function createRealtimeSessionRuntime({
         const restoring = ['restore', 'session'].includes(event.__voiceOrigin)
         const failedContext = restoring ? {} : (
           presentationRuntime.get(realtimeResponseId(event)) || {
-            turnId: turns.responseTurn().turnId,
+            turnId: turns.committedTurnId || turns.turnId,
           }
         )
         const generation = ++contentRecoveryGeneration

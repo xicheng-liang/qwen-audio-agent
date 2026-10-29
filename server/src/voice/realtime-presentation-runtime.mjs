@@ -145,8 +145,16 @@ export class RealtimePresentationRuntime {
     }
   }
 
+  // GPT-Live (concurrent voice playback) starts a delegated reply a moment
+  // before it reports the end of speech; other providers keep the old rule.
+  #responseTurn() {
+    return this.turns.responseTurn({
+      replyDuringSpeech: this.getFrontend?.()?.capabilities?.concurrentVoicePlayback === true,
+    })
+  }
+
   fallbackContext() {
-    const turn = this.turns.responseTurn()
+    const turn = this.#responseTurn()
     return {
       turnId: turn.turnId,
       taskId: null,
@@ -168,7 +176,7 @@ export class RealtimePresentationRuntime {
     const automaticTurn = automaticResponse
       ? this.getResponseTurnCandidate()
       : null
-    const responseTurn = this.turns.responseTurn()
+    const responseTurn = this.#responseTurn()
     const fallback = {
       turnId: source.__voiceContext?.turnId
         || automaticTurn?.turnId

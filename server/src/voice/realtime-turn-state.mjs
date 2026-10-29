@@ -47,13 +47,13 @@ export class RealtimeTurnState {
     }
   }
 
-  // The turn a response that names none belongs to. A voice turn already under
-  // way (its transcript not in yet) is newer than the last committed turn: a
-  // provider that starts its reply before reporting the end of speech answers it.
-  responseTurn() {
-    const voiceUnderWay = (this.userSpeaking || this.voiceStartItemId)
+  // The turn a response that names none belongs to. With replyDuringSpeech (a
+  // provider that starts its reply before reporting the end of speech), a voice
+  // turn still being spoken is newer than the last committed turn and owns it.
+  responseTurn({ replyDuringSpeech = false } = {}) {
+    const speaking = replyDuringSpeech && this.userSpeaking
       && this.turnGeneration > this.committedTurnGeneration
-    return this.committedTurnId && !voiceUnderWay ? this.committed() : this.current()
+    return this.committedTurnId && !speaking ? this.committed() : this.current()
   }
 
   beginVoice(itemId) {
